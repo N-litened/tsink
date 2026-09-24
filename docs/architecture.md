@@ -165,7 +165,7 @@ To contain lock contention, `ChunkStorage` organises mutable state into five sep
 
 | Struct                  | Contents                                                                                                       |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `CatalogState`          | `SeriesRegistry`, 64 `write_txn_shards` (`Mutex`), pending series IDs, persistence lock.                       |
+| `CatalogState`          | `SeriesRegistry`, 64 `write_txn_shards` (`Mutex`), pending series IDs, persistence lock, registry catalog cache. |
 | `ChunkBufferState`      | 64-shard active builders, 64-shard sealed chunks, persisted-chunk watermarks, monotone chunk sequence counter. |
 | `VisibilityState`       | Tombstones, materialized series, per-series visibility summaries, flush visibility RwLock.                     |
 | `PersistedStorageState` | `PersistedIndexState`, WAL handle, compactors, tiered-storage config, pending segment diff.                    |
@@ -390,7 +390,7 @@ The registry maps `(metric, labels)` pairs to stable numeric `SeriesId` values a
 
 ### Persistence
 
-The registry is persisted as a binary RIDX v2 file (`series_index.bin`) with incremental delta checkpoints in `series_index.delta.d/`. On startup, `registry_catalog.rs` validates per-segment xxh64 fingerprints against the catalog; a mismatch triggers a full registry rebuild from segment postings files.
+The registry is persisted as a binary RIDX v2 file (`series_index.bin`) with incremental delta checkpoints in `series_index.delta.d/`. On startup, `registry_catalog.rs` validates per-segment xxh64 fingerprints against the catalog; a mismatch triggers a full registry rebuild from segment postings files. While the storage is open, the catalog's inputs are kept in memory: each segment's manifest fingerprint is read once, when the segment becomes visible, and its series metadata only when the set of visible segments changes, so keeping the catalog current costs work proportional to the segments that changed, and an unchanged catalog is not rewritten.
 
 ---
 

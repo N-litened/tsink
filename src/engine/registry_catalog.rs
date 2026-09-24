@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use roaring::RoaringTreemap;
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh64::Xxh64;
 
@@ -88,13 +90,237 @@ pub(super) fn validate_registry_catalog(
     }))
 }
 
+/// Writes the registry catalog sidecar describing `sources`, unless the copy on
+/// disk already does.
 pub(super) fn persist_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
+    cache: &mut RegistryCatalogCache,
 ) -> Result<()> {
     let path = catalog_path(snapshot_path);
-    let bytes = serde_json::to_vec_pretty(&build_catalog(sources)?)?;
-    write_file_atomically_and_sync_parent(&path, &bytes)
+    if cache.persisted.is_none() {
+        cache.sync_segments(sources)?;
+        if let Some(on_disk) = read_catalog_file(&path)? {
+            cache.adopt(sources, on_disk);
+        }
+    }
+    let catalog = cache.catalog(sources)?;
+    let on_disk_matches =
+        cache.persisted.as_ref() == Some(&catalog) && path_exists_no_follow(&path)?;
+    if !on_disk_matches {
+        write_file_atomically_and_sync_parent(&path, &serde_json::to_vec_pretty(&catalog)?)?;
+    }
+    cache.persisted = Some(catalog);
+    Ok(())
+}
+
+fn read_catalog_file(path: &Path) -> Result<Option<PersistedRegistryCatalogFile>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    Ok(serde_json::from_slice(&bytes).ok())
+}
+
+type CatalogSeriesKey = Arc<(String, Vec<Label>)>;
+
+/// What the registry catalog sidecar is built from, kept in memory.
+///
+/// A published segment root never changes contents: segment ids are never
+/// reused, and publication refuses to replace an existing root with different
+/// contents. So a segment's manifest fingerprint is read once, when its root first
+/// appears among the catalog sources, and its series metadata once, the first time
+/// the set of segments changes while it is visible; the series fingerprint is only
+/// recomputed when that set changes. After a restart the catalog on disk is
+/// adopted as long as it still describes the visible segments, so reopening does
+/// not need the segments' series files. The catalog last known to be on disk is
+/// kept too, so an unchanged catalog is neither read back nor rewritten.
+#[derive(Default)]
+pub(super) struct RegistryCatalogCache {
+    segments: HashMap<PathBuf, CachedCatalogSegment>,
+    series: BTreeMap<SeriesId, CachedCatalogSeries>,
+    series_ids_by_key: BTreeMap<CatalogSeriesKey, SeriesId>,
+    series_fingerprint: Option<PersistedRegistrySeriesFingerprint>,
+    persisted: Option<PersistedRegistryCatalogFile>,
+}
+
+struct CachedCatalogSegment {
+    entry: PersistedRegistryCatalogEntry,
+    series_ids: Option<RoaringTreemap>,
+}
+
+struct CachedCatalogSeries {
+    key: CatalogSeriesKey,
+    segments: u64,
+}
+
+impl RegistryCatalogCache {
+    fn catalog(
+        &mut self,
+        sources: &[PersistedRegistryCatalogSource],
+    ) -> Result<PersistedRegistryCatalogFile> {
+        self.sync_segments(sources)?;
+        let series_fingerprint = match &self.series_fingerprint {
+            Some(series_fingerprint) => series_fingerprint.clone(),
+            None => {
+                for source in sources {
+                    self.load_series(&source.root)?;
+                }
+                let series_fingerprint =
+                    fingerprint_series(self.series.iter().map(|(series_id, cached)| {
+                        (*series_id, cached.key.0.as_str(), cached.key.1.as_slice())
+                    }));
+                self.series_fingerprint = Some(series_fingerprint.clone());
+                series_fingerprint
+            }
+        };
+        Ok(PersistedRegistryCatalogFile {
+            version: REGISTRY_CATALOG_VERSION,
+            segments: self.entries(sources),
+            series_fingerprint: Some(series_fingerprint),
+        })
+    }
+
+    fn entries(
+        &self,
+        sources: &[PersistedRegistryCatalogSource],
+    ) -> Vec<PersistedRegistryCatalogEntry> {
+        let mut entries = sources
+            .iter()
+            .filter_map(|source| self.segments.get(&source.root))
+            .map(|segment| segment.entry.clone())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.lane, entry.level, entry.segment_id));
+        entries
+    }
+
+    fn adopt(
+        &mut self,
+        sources: &[PersistedRegistryCatalogSource],
+        on_disk: PersistedRegistryCatalogFile,
+    ) {
+        if on_disk.version != REGISTRY_CATALOG_VERSION
+            || on_disk.series_fingerprint.is_none()
+            || on_disk.segments != self.entries(sources)
+        {
+            return;
+        }
+        self.series_fingerprint = on_disk.series_fingerprint.clone();
+        self.persisted = Some(on_disk);
+    }
+
+    fn sync_segments(&mut self, sources: &[PersistedRegistryCatalogSource]) -> Result<()> {
+        let listed = sources
+            .iter()
+            .map(|source| source.root.as_path())
+            .collect::<HashSet<_>>();
+        let unlisted = self
+            .segments
+            .keys()
+            .filter(|root| !listed.contains(root.as_path()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for root in unlisted {
+            self.remove_segment(&root);
+        }
+        for source in sources {
+            if self.segments.contains_key(&source.root) {
+                continue;
+            }
+            let entry = build_catalog_entry(source)?;
+            self.segments.insert(
+                source.root.clone(),
+                CachedCatalogSegment {
+                    entry,
+                    series_ids: None,
+                },
+            );
+            self.series_fingerprint = None;
+        }
+        Ok(())
+    }
+
+    fn load_series(&mut self, root: &Path) -> Result<()> {
+        if self
+            .segments
+            .get(root)
+            .is_none_or(|segment| segment.series_ids.is_some())
+        {
+            return Ok(());
+        }
+
+        let mut series_ids = RoaringTreemap::new();
+        let mut new_series = BTreeMap::<SeriesId, CatalogSeriesKey>::new();
+        let mut new_series_ids_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
+        for series in crate::engine::segment::load_segment_series_metadata(root)? {
+            series_ids.insert(series.series_id);
+            let key = (series.metric, series.labels);
+            let known_key = self
+                .series
+                .get(&series.series_id)
+                .map(|cached| &*cached.key)
+                .or_else(|| new_series.get(&series.series_id).map(|key| &**key));
+            match known_key {
+                Some(known_key) if *known_key == key => continue,
+                Some(_) => {
+                    return Err(TsinkError::DataCorruption(format!(
+                        "series id {} conflicts across persisted segment metadata",
+                        series.series_id
+                    )));
+                }
+                None => {}
+            }
+            let bound_id = self
+                .series_ids_by_key
+                .get(&key)
+                .or_else(|| new_series_ids_by_key.get(&key));
+            if let Some(bound_id) = bound_id {
+                return Err(TsinkError::DataCorruption(format!(
+                    "series key already bound to id {}, persisted segment metadata tried to bind {}",
+                    bound_id, series.series_id
+                )));
+            }
+            new_series_ids_by_key.insert(key.clone(), series.series_id);
+            new_series.insert(series.series_id, Arc::new(key));
+        }
+
+        for (series_id, key) in new_series {
+            self.series_ids_by_key.insert(Arc::clone(&key), series_id);
+            self.series
+                .insert(series_id, CachedCatalogSeries { key, segments: 0 });
+        }
+        for series_id in &series_ids {
+            if let Some(cached) = self.series.get_mut(&series_id) {
+                cached.segments += 1;
+            }
+        }
+        if let Some(segment) = self.segments.get_mut(root) {
+            segment.series_ids = Some(series_ids);
+        }
+        Ok(())
+    }
+
+    fn remove_segment(&mut self, root: &Path) {
+        let Some(segment) = self.segments.remove(root) else {
+            return;
+        };
+        self.series_fingerprint = None;
+        let Some(series_ids) = segment.series_ids else {
+            return;
+        };
+        for series_id in &series_ids {
+            let Some(cached) = self.series.get_mut(&series_id) else {
+                continue;
+            };
+            cached.segments = cached.segments.saturating_sub(1);
+            if cached.segments == 0 {
+                if let Some(cached) = self.series.remove(&series_id) {
+                    self.series_ids_by_key.remove(&*cached.key);
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn inventory_sources(
@@ -126,6 +352,7 @@ pub(super) fn validate_registry_snapshot(
     ))
 }
 
+#[cfg(test)]
 fn build_catalog(
     sources: &[PersistedRegistryCatalogSource],
 ) -> Result<PersistedRegistryCatalogFile> {
@@ -174,6 +401,7 @@ fn build_catalog_entry(
     })
 }
 
+#[cfg(test)]
 fn build_series_fingerprint_from_sources(
     sources: &[PersistedRegistryCatalogSource],
 ) -> Result<PersistedRegistrySeriesFingerprint> {
@@ -209,7 +437,13 @@ fn build_series_fingerprint_from_sources(
         }
     }
 
-    Ok(fingerprint_series(series_by_id.values()))
+    Ok(fingerprint_series(series_by_id.values().map(|series| {
+        (
+            series.series_id,
+            series.metric.as_str(),
+            series.labels.as_slice(),
+        )
+    })))
 }
 
 fn indexed_segment_series_ids(indexed_segments: &[IndexedSegment]) -> Vec<SeriesId> {
@@ -241,20 +475,26 @@ fn fingerprint_registry_series(
             value_family: None,
         });
     }
-    Ok(fingerprint_series(series.iter()))
+    Ok(fingerprint_series(series.iter().map(|series| {
+        (
+            series.series_id,
+            series.metric.as_str(),
+            series.labels.as_slice(),
+        )
+    })))
 }
 
 fn fingerprint_series<'a>(
-    series: impl IntoIterator<Item = &'a crate::engine::segment::PersistedSeries>,
+    series: impl IntoIterator<Item = (SeriesId, &'a str, &'a [Label])>,
 ) -> PersistedRegistrySeriesFingerprint {
     let mut count = 0usize;
     let mut hasher = Xxh64::new(0);
-    for series in series {
+    for (series_id, metric, labels) in series {
         count = count.saturating_add(1);
-        hasher.update(&series.series_id.to_le_bytes());
-        update_len_prefixed_bytes(&mut hasher, series.metric.as_bytes());
-        hasher.update(&(series.labels.len() as u64).to_le_bytes());
-        for label in &series.labels {
+        hasher.update(&series_id.to_le_bytes());
+        update_len_prefixed_bytes(&mut hasher, metric.as_bytes());
+        hasher.update(&(labels.len() as u64).to_le_bytes());
+        for label in labels {
             update_len_prefixed_bytes(&mut hasher, label.name.as_bytes());
             update_len_prefixed_bytes(&mut hasher, label.value.as_bytes());
         }
@@ -269,3 +509,7 @@ fn update_len_prefixed_bytes(hasher: &mut Xxh64, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
 }
+
+#[cfg(test)]
+#[path = "registry_catalog/tests.rs"]
+mod tests;

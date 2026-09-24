@@ -3717,3 +3717,56 @@ fn close_waits_for_inflight_background_refresh_before_final_persist() {
     close_thread.join().unwrap();
     assert!(scan_calls.load(Ordering::SeqCst) >= 1);
 }
+
+#[test]
+fn flush_persists_the_registry_catalog_without_rereading_older_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_numeric_storage(temp_dir.path(), TimestampPrecision::Seconds, 8);
+    let labels = vec![Label::new("host", "a")];
+    let mut roots = Vec::new();
+    for ts in [1, 2] {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "catalog_cache",
+                labels.clone(),
+                DataPoint::new(ts, ts as f64),
+            )])
+            .unwrap();
+        storage.flush_pipeline_once().unwrap();
+    }
+    for segment in load_segments_for_level(temp_dir.path().join(NUMERIC_LANE_ROOT), 0).unwrap() {
+        roots.push(segment.root);
+    }
+    assert_eq!(roots.len(), 2);
+    for root in &roots {
+        std::fs::remove_file(root.join("manifest.bin")).unwrap();
+        std::fs::remove_file(root.join("series.bin")).unwrap();
+    }
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_cache",
+            labels.clone(),
+            DataPoint::new(3, 3.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let catalog: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(super::super::registry_catalog::catalog_path(
+            &checkpoint_path,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(catalog["segments"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        storage.select("catalog_cache", &labels, 0, 10).unwrap(),
+        vec![
+            DataPoint::new(1, 1.0),
+            DataPoint::new(2, 2.0),
+            DataPoint::new(3, 3.0)
+        ]
+    );
+}

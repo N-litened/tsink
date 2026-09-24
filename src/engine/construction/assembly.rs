@@ -72,6 +72,7 @@ impl StorageStateAssembly {
             pending_series_ids: RwLock::new(BTreeSet::new()),
             delta_series_count: AtomicU64::new(0),
             persistence_lock: Mutex::new(()),
+            registry_catalog_cache: Mutex::new(Default::default()),
             metadata_shard_index: metadata_shard_count.map(MetadataShardIndex::new),
             write_txn_shards: std::array::from_fn(|_| Mutex::new(())),
         }

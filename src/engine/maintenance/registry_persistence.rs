@@ -63,15 +63,11 @@ impl ChunkStorage {
         checkpoint_path: &Path,
         sources: &[registry_catalog::PersistedRegistryCatalogSource],
     ) -> Result<()> {
-        if matches!(
-            registry_catalog::validate_registry_catalog(checkpoint_path, sources)?,
-            Some(registry_catalog::ValidatedRegistryCatalog {
-                series_fingerprint: Some(_),
-            })
-        ) {
-            return Ok(());
-        }
-        registry_catalog::persist_registry_catalog(checkpoint_path, sources)
+        registry_catalog::persist_registry_catalog(
+            checkpoint_path,
+            sources,
+            &mut self.catalog.registry_catalog_cache.lock(),
+        )
     }
 
     fn persist_series_registry_catalog_index(&self, checkpoint_path: &Path) -> Result<()> {

@@ -143,6 +143,7 @@ struct CatalogState {
     pending_series_ids: RwLock<BTreeSet<SeriesId>>,
     delta_series_count: AtomicU64,
     persistence_lock: Mutex<()>,
+    registry_catalog_cache: Mutex<registry_catalog::RegistryCatalogCache>,
     metadata_shard_index: Option<MetadataShardIndex>,
     write_txn_shards: [Mutex<()>; REGISTRY_TXN_SHARD_COUNT],
 }
