@@ -120,7 +120,6 @@ impl ChunkStorage {
 
     fn execute_close_pipeline(&self) -> Result<()> {
         let shutdown = self.lifecycle_shutdown_context();
-        let _background_maintenance_guard = shutdown.background_maintenance_gate();
         let mut deferred_dirty_refresh = false;
         let _write_permits = shutdown.acquire_close_write_permits()?;
         self.flush_all_active()?;
@@ -154,8 +153,16 @@ impl ChunkStorage {
     }
 
     pub(in super::super) fn close_impl(&self) -> Result<()> {
+        // Background flush, persisted-refresh and rollup passes run under the maintenance
+        // gate, and a rollup pass writes its buckets through the regular write path. Let an
+        // in-flight pass finish while the storage still accepts writes, and only then start
+        // rejecting them; passes that queue behind close see it closing and stand down.
+        let background_maintenance_guard = self
+            .lifecycle_shutdown_context()
+            .background_maintenance_gate();
         self.start_close_transition()?;
         let close_result = self.execute_close_pipeline();
+        drop(background_maintenance_guard);
         self.finish_close_transition(close_result)
     }
 }

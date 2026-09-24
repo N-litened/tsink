@@ -138,7 +138,9 @@ The thread runs both the numeric compactor and the blob compactor in sequence on
 wakeup. A mutex (`compaction_lock`) serialises the thread against manual compaction
 calls and against snapshot operations.
 
-On `close()`, the engine acquires all write permits, flushes active state to segments,
+On `close()`, the engine first waits for an in-flight background flush, persisted-refresh or
+rollup pass to finish (rollup passes write through the regular write path, which rejects
+writes once the engine is closing), then acquires all write permits, flushes active state to segments,
 and then runs up to **128** compaction passes to drain any remaining work before
 shutting down background threads.
 

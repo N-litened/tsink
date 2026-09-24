@@ -1318,6 +1318,24 @@ fn close_waits_for_inflight_background_rollup_before_final_persist() {
         .unwrap()
         .is_ok());
     close_thread.join().unwrap();
+
+    let health = storage.observability_snapshot().health;
+    assert_eq!(
+        health.background_errors_total, 0,
+        "the in-flight rollup pass failed: {:?}",
+        health.last_background_error
+    );
+    drop(storage);
+
+    let reopened = reopen_persistent_rollup_storage(temp_dir.path());
+    let rollups = reopened.observability_snapshot().rollups.policies;
+    assert_eq!(rollups.len(), 1);
+    assert_eq!(
+        rollups[0].materialized_through,
+        Some(5_000),
+        "the in-flight rollup pass should have been persisted by close"
+    );
+    reopened.close().unwrap();
 }
 
 #[test]
