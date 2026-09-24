@@ -3770,3 +3770,103 @@ fn flush_persists_the_registry_catalog_without_rereading_older_segments() {
         ]
     );
 }
+
+#[test]
+fn compaction_waits_until_a_flushed_segment_persists_its_recovery_metadata() {
+    use std::sync::Mutex;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = Arc::new(persistent_numeric_storage(
+        temp_dir.path(),
+        TimestampPrecision::Milliseconds,
+        8,
+    ));
+    let labels = vec![Label::new("host", "a")];
+    let rows = |points: &[(i64, f64)]| {
+        points
+            .iter()
+            .map(|&(ts, value)| {
+                Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(ts, value))
+            })
+            .collect::<Vec<_>>()
+    };
+    storage
+        .insert_rows(&rows(&[(0, 1.0), (1_000, 3.0), (2_000, 5.0)]))
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage
+        .insert_rows(&rows(&[(500, 2.0), (1_500, 4.0)]))
+        .unwrap();
+
+    let (compacted_tx, compacted_rx) = mpsc::channel();
+    let compacted_rx = Mutex::new(compacted_rx);
+    let compaction = Arc::new(Mutex::new(None));
+    storage.set_persist_post_publish_hook({
+        let storage = Arc::downgrade(&storage);
+        let compaction = Arc::clone(&compaction);
+        move |_| {
+            let Some(storage) = storage.upgrade() else {
+                return;
+            };
+            let compacted_tx = compacted_tx.clone();
+            *compaction.lock().unwrap() = Some(std::thread::spawn(move || {
+                let _compaction_guard = storage.compaction_gate();
+                let changes = ChunkStorage::compact_compactors_with_changes(
+                    storage.persisted.numeric_compactor.as_ref(),
+                    None,
+                    None,
+                );
+                let _ = compacted_tx.send(());
+                changes
+            }));
+            let _ = compacted_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(300));
+        }
+    });
+
+    let flushed = storage.flush_pipeline_once();
+    storage.clear_persist_post_publish_hook();
+    let changes = compaction
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the flush should have written a segment")
+        .join()
+        .unwrap()
+        .unwrap();
+    flushed.expect("compaction must not take the flushed segment before the flush finishes");
+    assert!(
+        !changes.is_empty(),
+        "segments overlapping within a series should be compacted"
+    );
+
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .merge(changes);
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    let points = storage.select("cpu_usage", &labels, 0, 10_000).unwrap();
+    assert_eq!(
+        points
+            .iter()
+            .map(|point| (point.timestamp, point.value_as_f64().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 1.0),
+            (500, 2.0),
+            (1_000, 3.0),
+            (1_500, 4.0),
+            (2_000, 5.0)
+        ]
+    );
+    storage.close().unwrap();
+}

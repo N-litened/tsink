@@ -4,7 +4,7 @@ use super::super::maintenance::{
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use parking_lot::RwLock;
+use parking_lot::{MutexGuard, RwLock};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in super::super) struct PersistSegmentOutcome {
@@ -202,7 +202,7 @@ impl ChunkStorage {
     fn stage_flush_segment_publication(
         &self,
         snapshot_ctx: FlushSnapshotContext<'_>,
-    ) -> Result<Option<StagedFlushPublish>> {
+    ) -> Result<Option<(MutexGuard<'_, ()>, StagedFlushPublish)>> {
         if snapshot_ctx.numeric_lane_path.is_none() && snapshot_ctx.blob_lane_path.is_none() {
             return Ok(None);
         }
@@ -234,6 +234,10 @@ impl ChunkStorage {
             ));
         }
 
+        // Compaction picks its sources by scanning the segment directories, so it would merge
+        // and delete a new root that a failure here or in verification or recovery metadata
+        // persistence still has to roll back. The caller holds the gate until then.
+        let compaction_guard = self.compaction_gate();
         let published_segment_roots = {
             let registry = snapshot_ctx.registry.read();
             let mut published_segment_roots = Vec::new();
@@ -286,18 +290,21 @@ impl ChunkStorage {
         let mut flushed_watermarks = numeric_watermarks;
         flushed_watermarks.extend(blob_watermarks);
 
-        Ok(Some(StagedFlushPublish {
-            outcome: PersistSegmentOutcome {
-                persisted: true,
-                series,
-                chunks,
-                points,
-                segments: published_segment_roots.len(),
+        Ok(Some((
+            compaction_guard,
+            StagedFlushPublish {
+                outcome: PersistSegmentOutcome {
+                    persisted: true,
+                    series,
+                    chunks,
+                    points,
+                    segments: published_segment_roots.len(),
+                },
+                published_segment_roots,
+                flushed_watermarks,
+                wal_highwater,
             },
-            published_segment_roots,
-            flushed_watermarks,
-            wal_highwater,
-        }))
+        )))
     }
 
     fn verify_flush_segment_publication(
@@ -337,8 +344,8 @@ impl ChunkStorage {
     ) -> Result<()> {
         // Recovery metadata must reach disk before the newly published segment roots are
         // allowed to become the engine's durable view. If this step fails, roll the new
-        // roots back rather than exposing data that restart cannot fully recover.
-        let _compaction_guard = self.compaction_gate();
+        // roots back rather than exposing data that restart cannot fully recover. The caller
+        // holds the compaction gate, so compaction cannot have taken the new roots.
         if publish_ctx.0.load(Ordering::SeqCst) {
             if let Err(err) = self.apply_known_dirty_persisted_refresh_if_pending() {
                 tracing::warn!(
@@ -519,7 +526,9 @@ impl ChunkStorage {
                 wal: self.persisted.wal.as_ref(),
             };
             let publish_ctx = FlushPublishContext(&self.persisted.persisted_index_dirty);
-            let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx)? else {
+            let Some((compaction_guard, staged_flush)) =
+                self.stage_flush_segment_publication(snapshot_ctx)?
+            else {
                 return Ok(PersistSegmentOutcome::default());
             };
             let verified_flush = self.verify_flush_segment_publication(staged_flush)?;
@@ -527,6 +536,7 @@ impl ChunkStorage {
                 publish_ctx,
                 &verified_flush.published_segment_roots,
             )?;
+            drop(compaction_guard);
 
             if let Some(wal) = snapshot_ctx.wal {
                 wal.mark_durable_through(verified_flush.wal_highwater);
