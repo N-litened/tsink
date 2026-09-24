@@ -148,6 +148,8 @@ impl FramedWal {
             append_sync_hook: Mutex::new(None),
             #[cfg(test)]
             cached_series_definition_rebuild_hook: Mutex::new(None),
+            #[cfg(test)]
+            reset_hook: Mutex::new(None),
         };
 
         if existing_published_highwater.is_none() {
@@ -206,6 +208,10 @@ impl FramedWal {
         Ok(self.segment_count.load(Ordering::Acquire))
     }
 
+    // The writer lock is held until the segment accounting and the publish marker describe the
+    // truncated segment. A write admitted earlier would start from the old segment size, so a
+    // later rollback would pad the segment with zeros or cut published frames, and its publish
+    // marker would race this one through the shared temporary file.
     fn reset_locked(&self, mut writer: MutexGuard<'_, BufWriter<File>>) -> Result<()> {
         writer.flush()?;
         writer.get_mut().sync_data()?;
@@ -222,7 +228,7 @@ impl FramedWal {
         );
         let _ = old_writer.into_parts();
         writer.get_ref().sync_data()?;
-        drop(writer);
+        self.invoke_reset_hook();
 
         let reset_result = (|| -> Result<()> {
             for segment in collect_wal_segment_files(&self.dir)? {
@@ -255,7 +261,23 @@ impl FramedWal {
         self.mark_published_through(reset_highwater);
         self.mark_durable_through(reset_highwater);
         *self.last_sync.lock() = Instant::now();
+        drop(writer);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine) fn set_reset_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.reset_hook.lock() = Some(Arc::new(hook));
+    }
+
+    fn invoke_reset_hook(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.reset_hook.lock().clone() {
+            hook();
+        }
     }
 
     pub fn reset(&self) -> Result<()> {

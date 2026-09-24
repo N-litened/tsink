@@ -63,6 +63,8 @@ const FRAME_TYPE_SAMPLES: u8 = 2;
 type WalAppendSyncHook = dyn Fn() -> Result<()> + Send + Sync + 'static;
 #[cfg(test)]
 type WalCachedSeriesDefinitionRebuildHook = dyn Fn() + Send + Sync + 'static;
+#[cfg(test)]
+type WalResetHook = dyn Fn() + Send + Sync + 'static;
 
 #[derive(Debug, Clone)]
 pub struct SeriesDefinitionFrame {
@@ -198,4 +200,6 @@ pub struct FramedWal {
     append_sync_hook: Mutex<Option<Arc<WalAppendSyncHook>>>,
     #[cfg(test)]
     cached_series_definition_rebuild_hook: Mutex<Option<Arc<WalCachedSeriesDefinitionRebuildHook>>>,
+    #[cfg(test)]
+    reset_hook: Mutex<Option<Arc<WalResetHook>>>,
 }

@@ -761,6 +761,109 @@ fn wal_reset_preserves_monotonic_sequence() {
     assert_eq!(wal.current_durable_highwater().frame, 2);
 }
 
+fn reset_race_definition(series_id: u64) -> SeriesDefinitionFrame {
+    SeriesDefinitionFrame {
+        series_id,
+        metric: format!("cpu_{series_id}"),
+        labels: vec![Label::new("host", "a")],
+    }
+}
+
+fn begin_definition_write(wal: &FramedWal, series_id: u64) -> super::LogicalWalWrite<'_> {
+    let definition = reset_race_definition(series_id);
+    let payload = FramedWal::encode_series_definition_frame_payload(&definition).unwrap();
+    let estimated_bytes = FramedWal::estimate_series_definition_frame_bytes(&definition).unwrap();
+    let mut logical = wal.begin_logical_write(estimated_bytes).unwrap();
+    logical.append_series_definition_payload(&payload).unwrap();
+    logical
+}
+
+fn replayed_series_ids(wal: &FramedWal) -> Vec<u64> {
+    wal.replay_frames()
+        .unwrap()
+        .into_iter()
+        .map(|frame| match frame {
+            ReplayFrame::SeriesDefinition(definition) => definition.series_id,
+            ReplayFrame::Samples(_) => panic!("expected series definition frames only"),
+        })
+        .collect()
+}
+
+fn write_while_reset_is_paused<F>(wal: &Arc<FramedWal>, write: F)
+where
+    F: FnOnce(&FramedWal) + Send + 'static,
+{
+    let reached = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    {
+        let reached = Arc::clone(&reached);
+        let release = Arc::clone(&release);
+        wal.set_reset_hook(move || {
+            reached.wait();
+            release.wait();
+        });
+    }
+
+    let resetter = {
+        let wal = Arc::clone(wal);
+        std::thread::spawn(move || wal.reset())
+    };
+    reached.wait();
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer = {
+        let wal = Arc::clone(wal);
+        std::thread::spawn(move || {
+            write(&wal);
+            let _ = done_tx.send(());
+        })
+    };
+    let _ = done_rx.recv_timeout(std::time::Duration::from_millis(200));
+
+    release.wait();
+    resetter.join().unwrap().unwrap();
+    writer.join().unwrap();
+}
+
+#[test]
+fn write_rolled_back_while_a_reset_finishes_leaves_no_zero_hole() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = Arc::new(FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap());
+    for series_id in 0..3 {
+        wal.append_series_definition(&reset_race_definition(series_id))
+            .unwrap();
+    }
+
+    write_while_reset_is_paused(&wal, |wal| {
+        begin_definition_write(wal, 10).abort().unwrap();
+    });
+    wal.append_series_definition(&reset_race_definition(11))
+        .unwrap();
+
+    assert_runtime_accounting_matches_disk(&wal, temp_dir.path());
+    assert_eq!(replayed_series_ids(&wal), vec![11]);
+}
+
+#[test]
+fn write_published_while_a_reset_finishes_survives_a_later_rollback() {
+    let temp_dir = TempDir::new().unwrap();
+    let wal = Arc::new(FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap());
+    for series_id in 0..3 {
+        wal.append_series_definition(&reset_race_definition(series_id))
+            .unwrap();
+    }
+
+    write_while_reset_is_paused(&wal, |wal| {
+        let mut logical = begin_definition_write(wal, 10);
+        logical.persist_pending().unwrap();
+        logical.publish_persisted().unwrap();
+    });
+    begin_definition_write(&wal, 11).abort().unwrap();
+
+    assert_runtime_accounting_matches_disk(&wal, temp_dir.path());
+    assert_eq!(replayed_series_ids(&wal), vec![10]);
+}
+
 #[test]
 fn ensure_min_next_seq_sets_sequence_floor() {
     let temp_dir = TempDir::new().unwrap();
@@ -1577,6 +1680,7 @@ fn failed_append_does_not_advance_next_seq() {
         segment_max_bytes: DEFAULT_WAL_SEGMENT_MAX_BYTES,
         append_sync_hook: parking_lot::Mutex::new(None),
         cached_series_definition_rebuild_hook: parking_lot::Mutex::new(None),
+        reset_hook: parking_lot::Mutex::new(None),
     };
 
     let err = wal.append_series_definition(&SeriesDefinitionFrame {
