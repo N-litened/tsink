@@ -402,7 +402,7 @@ impl ChunkStorage {
 
         // Publish the new persisted view as one visibility transition: install segment
         // indexes, refresh catalog/caches, and only then consider trimming WAL state.
-        let publication = self.begin_persisted_catalog_publication();
+        let mut publication = self.begin_persisted_catalog_publication();
         let flush_transition = PersistedCatalogTransition {
             visibility_fence: None,
             loaded_segments,
@@ -459,7 +459,12 @@ impl ChunkStorage {
             }
         }
 
-        drop(publication);
+        if let Err(err) = publication.finish() {
+            tracing::warn!(
+                error = %err,
+                "Failed to persist the registry catalog after flush publication; the next maintenance pass rewrites it"
+            );
+        }
 
         Ok((wal_highwater, outcome))
     }

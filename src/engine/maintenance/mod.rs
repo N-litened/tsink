@@ -139,16 +139,24 @@ enum MaintenanceInventorySource {
     Scanned,
 }
 
+/// Holds the visibility write fence while persisted-catalog transitions are
+/// swapped in. The registry catalog sidecar of the published state is recovery
+/// metadata that startup validates against the segments on disk, so it is written
+/// only after the fence is released: [`Self::finish`] reports a failure to the
+/// caller, and dropping the guard without finishing still writes it and logs a
+/// failure.
 pub(super) struct PersistedCatalogPublicationGuard<'a> {
     storage: &'a ChunkStorage,
-    _visibility_guard: RwLockWriteGuard<'a, ()>,
+    visibility_guard: Option<RwLockWriteGuard<'a, ()>>,
+    registry_catalog_sources: Option<Vec<registry_catalog::PersistedRegistryCatalogSource>>,
 }
 
 impl<'a> PersistedCatalogPublicationGuard<'a> {
     fn new(storage: &'a ChunkStorage) -> Self {
         Self {
             storage,
-            _visibility_guard: storage.visibility_write_fence(),
+            visibility_guard: Some(storage.visibility_write_fence()),
+            registry_catalog_sources: None,
         }
     }
 
@@ -157,23 +165,56 @@ impl<'a> PersistedCatalogPublicationGuard<'a> {
     }
 
     pub(super) fn publish_transition(
-        &self,
-        transition: PersistedCatalogTransition,
+        &mut self,
+        mut transition: PersistedCatalogTransition,
     ) -> Result<PersistedCatalogRefreshApply> {
-        self.storage.apply_persisted_catalog_transition_phase(
+        let registry_catalog_sources = transition.registry_catalog_sources.take();
+        let applied = self.storage.apply_persisted_catalog_transition_phase(
             transition,
             self.current_visibility_generation(),
-        )
+        )?;
+        if applied.is_applied() && registry_catalog_sources.is_some() {
+            self.registry_catalog_sources = registry_catalog_sources;
+        }
+        Ok(applied)
     }
 
     pub(super) fn apply_planned_refresh(
-        &self,
+        &mut self,
         planned: PlannedPersistedCatalogRefresh,
     ) -> Result<PersistedCatalogRefreshApply> {
         let transition = self
             .storage
             .plan_persisted_catalog_transition_phase(planned)?;
         self.publish_transition(transition)
+    }
+
+    pub(super) fn finish(mut self) -> Result<()> {
+        self.visibility_guard = None;
+        self.persist_registry_catalog()
+    }
+
+    fn persist_registry_catalog(&mut self) -> Result<()> {
+        let Some(sources) = self.registry_catalog_sources.take() else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        self.storage
+            .invoke_registry_catalog_publication_persist_hook();
+        self.storage
+            .persist_series_registry_index_with_catalog_sources(&sources)
+    }
+}
+
+impl Drop for PersistedCatalogPublicationGuard<'_> {
+    fn drop(&mut self) {
+        self.visibility_guard = None;
+        if let Err(err) = self.persist_registry_catalog() {
+            tracing::warn!(
+                error = %err,
+                "Failed to persist the registry catalog after a persisted catalog publication"
+            );
+        }
     }
 }
 

@@ -103,11 +103,14 @@ impl ChunkStorage {
         let (inventory, inventory_source) = retention.post_flush_maintenance_inventory()?;
         let mut plan = policy.post_flush_maintenance_plan(&inventory);
         if plan.is_empty() {
-            let publication = self.begin_persisted_catalog_publication();
+            let mut publication = self.begin_persisted_catalog_publication();
             match publication.publish_transition(
                 retention.plan_noop_inventory_transition(&inventory, inventory_source),
             )? {
-                PersistedCatalogRefreshApply::Applied => return Ok(0),
+                PersistedCatalogRefreshApply::Applied => {
+                    publication.finish()?;
+                    return Ok(0);
+                }
                 PersistedCatalogRefreshApply::SkippedStaleVisibleState => unreachable!(
                     "post-flush maintenance no-op publication should not use a visibility fence"
                 ),
@@ -119,12 +122,15 @@ impl ChunkStorage {
             let scanned_inventory = loaded.inventory;
             plan = policy.post_flush_maintenance_plan(&scanned_inventory);
             if plan.is_empty() {
-                let publication = self.begin_persisted_catalog_publication();
+                let mut publication = self.begin_persisted_catalog_publication();
                 match publication.publish_transition(retention.plan_noop_inventory_transition(
                     &scanned_inventory,
                     MaintenanceInventorySource::Scanned,
                 ))? {
-                    PersistedCatalogRefreshApply::Applied => return Ok(0),
+                    PersistedCatalogRefreshApply::Applied => {
+                        publication.finish()?;
+                        return Ok(0);
+                    }
                     PersistedCatalogRefreshApply::SkippedStaleVisibleState => unreachable!(
                         "post-flush maintenance no-op publication should not use a visibility fence"
                     ),
@@ -151,11 +157,11 @@ impl ChunkStorage {
             removed_roots,
         );
 
-        {
+        let registry_catalog_persisted = {
             // Publish staged retention/tiering outputs before retiring old roots so queries never
             // observe a window where superseded data disappeared before its replacement became
             // visible.
-            let publication = self.begin_persisted_catalog_publication();
+            let mut publication = self.begin_persisted_catalog_publication();
             let mut promoted_roots: Vec<PathBuf> = Vec::new();
             for promotion in &promotions {
                 if let Err(err) = retention.promote_staged_segment_for_publish(promotion) {
@@ -180,7 +186,8 @@ impl ChunkStorage {
             }
             self.evict_persisted_sealed_chunks();
             retention.record_tier_moves(tier_moves);
-        }
+            publication.finish()
+        };
 
         self.reconcile_live_metadata_indexes()?;
 
@@ -188,6 +195,8 @@ impl ChunkStorage {
             crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(path)?;
         }
 
-        retention.finalize_retired_roots(&retired_roots)
+        let expired = retention.finalize_retired_roots(&retired_roots)?;
+        registry_catalog_persisted?;
+        Ok(expired)
     }
 }

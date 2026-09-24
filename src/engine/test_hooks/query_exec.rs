@@ -300,4 +300,32 @@ impl ChunkStorage {
     pub(in super::super) fn clear_query_visibility_fenced_hook(&self) {
         super::clear_commit_hook(&self.persist_test_hooks.query_visibility_fenced_hook);
     }
+
+    pub(in super::super) fn invoke_registry_catalog_publication_persist_hook(&self) {
+        super::invoke_commit_hook(
+            &self
+                .persist_test_hooks
+                .registry_catalog_publication_persist_hook,
+        );
+    }
+
+    pub(in super::super) fn set_registry_catalog_publication_persist_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        super::set_commit_hook(
+            &self
+                .persist_test_hooks
+                .registry_catalog_publication_persist_hook,
+            hook,
+        );
+    }
+
+    pub(in super::super) fn clear_registry_catalog_publication_persist_hook(&self) {
+        super::clear_commit_hook(
+            &self
+                .persist_test_hooks
+                .registry_catalog_publication_persist_hook,
+        );
+    }
 }

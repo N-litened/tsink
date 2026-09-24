@@ -56,9 +56,9 @@ impl ChunkStorage {
             },
             registry_catalog_sources: Some(registry_catalog::inventory_sources(&inventory)),
         };
-        let publication = self.begin_persisted_catalog_publication();
+        let mut publication = self.begin_persisted_catalog_publication();
         match publication.publish_transition(transition)? {
-            PersistedCatalogRefreshApply::Applied => Ok(()),
+            PersistedCatalogRefreshApply::Applied => publication.finish(),
             PersistedCatalogRefreshApply::SkippedStaleVisibleState => {
                 unreachable!("direct segment catalog refresh should not use a visibility fence")
             }
@@ -123,7 +123,7 @@ impl ChunkStorage {
         };
 
         let restore_diff = planned.restore_known_dirty_diff();
-        let publication = self.begin_persisted_catalog_publication();
+        let mut publication = self.begin_persisted_catalog_publication();
         let apply_result = match publication.apply_planned_refresh(planned) {
             Ok(result) => result,
             Err(err) => {
@@ -139,6 +139,7 @@ impl ChunkStorage {
         }
 
         ctx.set_persisted_index_dirty(ctx.has_known_persisted_segment_changes());
+        publication.finish()?;
         Ok(true)
     }
 
@@ -156,12 +157,12 @@ impl ChunkStorage {
         let planned = self
             .catalog_refresh_context()
             .plan_loaded_inventory_catalog_refresh_phase(loaded)?;
-        let publication = self.begin_persisted_catalog_publication();
+        let mut publication = self.begin_persisted_catalog_publication();
         if publication.apply_planned_refresh(planned)?.is_applied() {
             self.catalog_refresh_context()
                 .set_persisted_index_dirty(false);
         }
-        Ok(())
+        publication.finish()
     }
 
     fn refresh_remote_catalog_claimed(&self) -> Result<()> {
@@ -169,11 +170,11 @@ impl ChunkStorage {
         let planned = ctx.plan_loaded_inventory_catalog_refresh_phase(
             ctx.load_remote_catalog_refresh_phase()?,
         )?;
-        let publication = self.begin_persisted_catalog_publication();
+        let mut publication = self.begin_persisted_catalog_publication();
         if publication.apply_planned_refresh(planned)?.is_applied() {
             ctx.mark_remote_catalog_refresh_success();
         }
-        Ok(())
+        publication.finish()
     }
 
     pub(in super::super) fn sync_persisted_segments_from_disk_if_dirty(&self) -> Result<()> {

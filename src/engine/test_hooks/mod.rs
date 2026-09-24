@@ -37,6 +37,7 @@ pub(super) struct PersistTestHooks {
         RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) query_persisted_chunk_decode_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) query_visibility_fenced_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) registry_catalog_publication_persist_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) tombstone_post_swap_pre_visibility_hook: RwLock<Option<Arc<IngestCommitHook>>>,
 }
 

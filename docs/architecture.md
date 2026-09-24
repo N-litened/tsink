@@ -451,12 +451,12 @@ A flush publishes many new segment entries and visibility summaries at once. Wit
 
 ### The solution
 
-`flush_visibility_lock` is a `RwLock<()>`:
+`flush_visibility_lock` is a `RecursiveReaderPreferringRWLock<()>`, a `parking_lot` read-write lock whose reads do not queue behind a waiting writer, so a query that takes it again while already holding it cannot deadlock:
 
-- **Writers** acquire the exclusive `write` lock for the entire duration of flush publication.
+- **Writers** acquire the exclusive `write` lock while a publication swaps in the new visible state.
 - **Readers** acquire a shared `read` lock during snapshot capture (step 3 of the read path).
 
-This is a brief, bounded mutual-exclusion window — not a per-operation lock. Normal write ingest does not touch this lock.
+This is a brief, bounded mutual-exclusion window — not a per-operation lock. Filesystem work is staged before the lock is taken, and the registry catalog sidecar (`series_index.catalog.json`) of the published state is written after it is released: it is recovery metadata that startup validates against the segments, so readers never wait for it. Normal write ingest does not touch this lock.
 
 ### Per-series visibility summaries
 

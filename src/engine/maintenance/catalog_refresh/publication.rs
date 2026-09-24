@@ -98,10 +98,6 @@ impl ChunkStorage {
             }
         }
 
-        if let Some(registry_catalog_sources) = transition.registry_catalog_sources {
-            self.persist_series_registry_index_with_catalog_sources(&registry_catalog_sources)?;
-        }
-
         Ok(PersistedCatalogRefreshApply::Applied)
     }
 }
