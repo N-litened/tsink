@@ -130,7 +130,7 @@ it does not, the replacement is treated as a corruption error.
 ## Background thread
 
 The compaction background thread runs continuously while the storage engine is open. It
-sleeps for `compaction_interval` (default **30 seconds**) between passes and wakes
+sleeps for `compaction_interval` (default **60 seconds**) between passes and wakes
 immediately when the flush pipeline signals that new segments have been written.
 
 The thread runs both the numeric compactor and the blob compactor in sequence on each
@@ -178,7 +178,7 @@ or tombstone removal is occurring over time.
 | `with_chunk_points(n)` | 2048 | Maximum points per chunk. Also controls the output segment size budget (`n × 512` points per output segment). Larger values produce fewer, bigger segments and reduce compaction frequency but increase per-segment memory and I/O cost. |
 
 There are no builder methods for the L0/L1 count triggers or the source window size; they
-are fixed at 32 and 64 respectively. The compaction interval is also fixed at 30 seconds in
+are fixed at 32 and 64 respectively. The compaction interval is also fixed at 60 seconds in
 the engine defaults.
 
 ---

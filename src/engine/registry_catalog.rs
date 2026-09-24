@@ -108,7 +108,7 @@ pub(super) fn persist_registry_catalog(
     let on_disk_matches =
         cache.persisted.as_ref() == Some(&catalog) && path_exists_no_follow(&path)?;
     if !on_disk_matches {
-        write_file_atomically_and_sync_parent(&path, &serde_json::to_vec_pretty(&catalog)?)?;
+        write_file_atomically_and_sync_parent(&path, &serde_json::to_vec(&catalog)?)?;
     }
     cache.persisted = Some(catalog);
     Ok(())

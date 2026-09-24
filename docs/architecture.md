@@ -400,7 +400,7 @@ tsink uses a three-level LSM-inspired compaction scheme.
 
 ```text
 Active chunks
-    │  background flush (5 s default)
+    │  background flush (10 s default)
     ▼
 L0 segments    ← trigger: 32 L0 segments → compact → L1
     ▼
@@ -666,8 +666,8 @@ The runtime (`src/engine/runtime.rs`) manages three background workers:
 
 | Worker     | Interval          | Activity                                                                               |
 | ---------- | ----------------- | -------------------------------------------------------------------------------------- |
-| Flush      | 5 s               | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
-| Compaction | 30 s (+ triggered)| Runs `Compactor::compact_once` for numeric and blob lanes.                             |
+| Flush      | 10 s              | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
+| Compaction | 60 s (+ triggered)| Runs `Compactor::compact_once` for numeric and blob lanes.                             |
 | Rollup     | 5 s               | Executes pending rollup materializations.                                              |
 
 Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) and stop themselves when the engine begins shutdown. If `background_fail_fast = true` (default), a background worker panic sets `fail_fast_triggered` and causes subsequent writes to return an error.
@@ -690,8 +690,8 @@ Key engine knobs and their defaults:
 | `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Total in-memory chunk budget.                           |    |    |     |
 | `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                            |    |    |     |
 | `chunk_points`                          | 2048                    | Points per sealed chunk.                                |    |    |     |
-| `compaction_interval`                   | 30 s                    | Background compaction frequency.                        |    |    |     |
-| `flush_interval`                        | 5 s                     | Background flush frequency.                             |    |    |     |
+| `compaction_interval`                   | 60 s                    | Background compaction frequency.                        |    |    |     |
+| `flush_interval`                        | 10 s                    | Background flush frequency.                             |    |    |     |
 | `background_fail_fast`                  | `true`                  | Worker panic triggers engine failure mode.              |    |    |     |
 
 Container-aware defaults: `cgroup.rs` reads `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to detect CPU and memory limits. The `TSINK_MAX_CPUS` environment variable overrides the detected CPU count.

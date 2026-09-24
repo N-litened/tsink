@@ -246,7 +246,7 @@ Match the partition duration to your typical query range. A common pattern is:
 
 ## 6. Compaction tuning
 
-Compaction merges L0 segments into L1, then L1 into L2. It runs in a background thread every **30 seconds**.
+Compaction merges L0 segments into L1, then L1 into L2. It runs in a background thread every **60 seconds**.
 
 ### Trigger thresholds
 

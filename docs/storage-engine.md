@@ -218,7 +218,7 @@ Queries use the search index to identify the candidate block and then decompress
 
 ## Flush Pipeline
 
-A background thread runs the flush pipeline on a configurable interval (default **5 s**):
+A background thread runs the flush pipeline on a configurable interval (default **10 s**):
 
 1. **Snapshot sealed chunks** — collect all sealed chunks whose sequence numbers exceed the persisted watermark for each series.
 2. **Write segment files** — group chunks by lane and write a new L0 segment directory using `SegmentWriter`.
@@ -291,7 +291,7 @@ Label-matcher queries intersect and difference these bitmaps to identify candida
 
 ## LSM-Style Compaction
 
-Compaction runs in a background loop (default **every 30 seconds**) and follows an LSM-style level hierarchy.
+Compaction runs in a background loop (default **every 60 seconds**) and follows an LSM-style level hierarchy.
 
 ### Levels
 
