@@ -1,6 +1,6 @@
 //! Concurrency utilities for tsink.
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, instrument};
@@ -159,6 +159,35 @@ impl<'a> Drop for SemaphoreGuard<'a> {
     }
 }
 
+/// A read-write lock whose `read` never waits for a queued writer while any read
+/// is held, so a thread can take a read again while it already holds one.
+///
+/// `parking_lot::RwLock::read` is task-fair: it queues behind a waiting writer even
+/// when the calling thread already holds a read, so a thread that reads twice
+/// while a writer queues in between deadlocks with that writer. Here `read` is
+/// `read_recursive`. The price is reader preference: a waiting writer gets the lock
+/// only once no read is held, so reads that keep overlapping keep it waiting.
+pub(crate) struct RecursiveReaderPreferringRWLock<T>(RwLock<T>);
+
+impl<T> RecursiveReaderPreferringRWLock<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(RwLock::new(value))
+    }
+
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, T> {
+        self.0.read_recursive()
+    }
+
+    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, T> {
+        self.0.write()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_locked_exclusive(&self) -> bool {
+        self.0.is_locked_exclusive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +330,68 @@ mod tests {
         }
 
         assert_eq!(sem.available_permits(), 2);
+    }
+
+    fn wait_for_writer<T>(lock: &RecursiveReaderPreferringRWLock<T>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock.is_locked_exclusive() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never queued"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn recursive_reader_preferring_rwlock_reads_again_while_a_writer_waits() {
+        let lock = Arc::new(RecursiveReaderPreferringRWLock::new(()));
+        let (outer_tx, outer_rx) = mpsc::channel();
+        let (queued_tx, queued_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        let reader = thread::spawn({
+            let lock = Arc::clone(&lock);
+            move || {
+                let _outer = lock.read();
+                outer_tx.send(()).unwrap();
+                queued_rx.recv().unwrap();
+                let _nested = lock.read();
+                done_tx.send(()).unwrap();
+            }
+        });
+        outer_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let writer = thread::spawn({
+            let lock = Arc::clone(&lock);
+            move || drop(lock.write())
+        });
+        wait_for_writer(&lock);
+        queued_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a nested read waited for the queued writer");
+        reader.join().unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn recursive_reader_preferring_rwlock_lets_readers_pass_a_waiting_writer() {
+        let lock = Arc::new(RecursiveReaderPreferringRWLock::new(0));
+        let held = lock.read();
+        let writer = thread::spawn({
+            let lock = Arc::clone(&lock);
+            move || *lock.write() += 1
+        });
+        wait_for_writer(&lock);
+        let (read_tx, read_rx) = mpsc::channel();
+        let reader = thread::spawn({
+            let lock = Arc::clone(&lock);
+            move || read_tx.send(*lock.read()).unwrap()
+        });
+        let passed = read_rx.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        assert_eq!(passed, Ok(0), "a reader waited for the queued writer");
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(*lock.read(), 1);
     }
 }

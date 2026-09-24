@@ -68,6 +68,7 @@ mod ingest_failures;
 mod persistence_background;
 mod persistence_recovery;
 mod persistence_segments;
+mod query_visibility;
 mod reliability;
 mod retention_policy;
 mod rollups;

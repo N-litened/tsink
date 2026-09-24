@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::concurrency::Semaphore;
+use crate::concurrency::{RecursiveReaderPreferringRWLock, Semaphore};
 use crate::engine::chunk::{self, Chunk, ChunkBuilder, ChunkPoint, ValueLane};
 use crate::engine::compactor::Compactor;
 use crate::engine::encoder::Encoder;
@@ -167,7 +167,7 @@ struct VisibilityState {
     max_observed_timestamp: AtomicI64,
     max_bounded_observed_timestamp: AtomicI64,
     recency_state_lock: Mutex<()>,
-    flush_visibility_lock: RwLock<()>,
+    flush_visibility_lock: RecursiveReaderPreferringRWLock<()>,
 }
 
 /// Persisted segment inventory, WAL handles, and remote refresh state.

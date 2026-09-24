@@ -171,6 +171,8 @@ impl ChunkStorage {
                 }
             } else {
                 let _visibility_guard = context.visibility_read_fence();
+                #[cfg(test)]
+                self.invoke_query_visibility_fenced_hook();
                 let mut rollup_stats = PersistedTierFetchStats::default();
                 let mut used_rollup = false;
                 let mut partial_rollup = false;

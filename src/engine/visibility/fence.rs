@@ -13,7 +13,7 @@ impl ChunkStorage {
             max_observed_timestamp: AtomicI64::new(i64::MIN),
             max_bounded_observed_timestamp: AtomicI64::new(i64::MIN),
             recency_state_lock: Mutex::new(()),
-            flush_visibility_lock: RwLock::new(()),
+            flush_visibility_lock: RecursiveReaderPreferringRWLock::new(()),
         }
     }
 
@@ -39,6 +39,11 @@ impl ChunkStorage {
         &self,
     ) -> RwLockWriteGuard<'_, ()> {
         self.visibility.flush_visibility_lock.write()
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn visibility_writer_pending(&self) -> bool {
+        self.visibility.flush_visibility_lock.is_locked_exclusive()
     }
 
     pub(in crate::engine::storage_engine) fn with_visibility_write_stage<R>(

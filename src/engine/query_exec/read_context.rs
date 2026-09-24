@@ -5,6 +5,7 @@ use super::{
     RoaringTreemap, RollupQueryCandidate, RwLock, RwLockReadGuard, SeriesId, SeriesRegistry,
     TieredQueryPlan, VisibilityCacheReadContext,
 };
+use crate::concurrency::RecursiveReaderPreferringRWLock;
 
 trait SeriesQueryReadOps {
     fn select_into_impl(
@@ -71,7 +72,7 @@ trait SeriesQueryReadOps {
 pub(super) struct SeriesQueryContext<'a> {
     planning: QueryPlanningContext<'a>,
     registry: &'a RwLock<SeriesRegistry>,
-    visibility_fence: &'a RwLock<()>,
+    visibility_fence: &'a RecursiveReaderPreferringRWLock<()>,
     ops: &'a dyn SeriesQueryReadOps,
 }
 
@@ -237,7 +238,7 @@ pub(super) struct TimeRangeFilterContext<'a> {
     pub(super) chunks: ChunkContext<'a>,
     pub(super) persisted_index: &'a RwLock<PersistedIndexState>,
     pub(super) visibility_cache: VisibilityCacheReadContext<'a>,
-    pub(super) visibility_fence: &'a RwLock<()>,
+    pub(super) visibility_fence: &'a RecursiveReaderPreferringRWLock<()>,
     pub(super) tombstones: &'a RwLock<crate::engine::tombstone::TombstoneMap>,
     pub(super) active_retention_cutoff: Option<i64>,
     pub(super) ops: &'a dyn TimeRangeFilterOps,

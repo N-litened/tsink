@@ -30,7 +30,7 @@ pub(super) use pagination::{RawSeriesPagination, RawSeriesScanPage};
 struct QuerySnapshotContext<'a> {
     chunks: ChunkContext<'a>,
     persisted_index: &'a RwLock<PersistedIndexState>,
-    visibility_fence: &'a RwLock<()>,
+    visibility_fence: &'a RecursiveReaderPreferringRWLock<()>,
     partition_window: i64,
 }
 

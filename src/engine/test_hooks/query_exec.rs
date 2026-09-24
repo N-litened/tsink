@@ -285,4 +285,19 @@ impl ChunkStorage {
                 .query_append_sort_in_memory_source_snapshot_hook,
         );
     }
+
+    pub(in super::super) fn invoke_query_visibility_fenced_hook(&self) {
+        super::invoke_commit_hook(&self.persist_test_hooks.query_visibility_fenced_hook);
+    }
+
+    pub(in super::super) fn set_query_visibility_fenced_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        super::set_commit_hook(&self.persist_test_hooks.query_visibility_fenced_hook, hook);
+    }
+
+    pub(in super::super) fn clear_query_visibility_fenced_hook(&self) {
+        super::clear_commit_hook(&self.persist_test_hooks.query_visibility_fenced_hook);
+    }
 }
