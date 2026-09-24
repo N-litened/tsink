@@ -109,6 +109,17 @@ impl Compactor {
         }
     }
 
+    #[cfg(test)]
+    pub(in crate::engine) fn with_level_triggers(
+        mut self,
+        l0_trigger: usize,
+        l1_trigger: usize,
+    ) -> Self {
+        self.l0_trigger = l0_trigger;
+        self.l1_trigger = l1_trigger;
+        self
+    }
+
     pub fn compact_once(&self) -> Result<bool> {
         Ok(self.compact_once_with_stats()?.compacted)
     }

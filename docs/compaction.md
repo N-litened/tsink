@@ -36,12 +36,15 @@ A compaction pass fires for a given level when either of the following is true:
 
 - **Count trigger** — the number of eligible segments at the source level reaches the
   configured threshold (default **4** for both L0→L1 and L1→L2).
-- **Time overlap** — any two segments at the source level have overlapping time ranges,
-  regardless of segment count.
+- **Series overlap** — two segments at the source level hold chunks of the same series
+  whose time ranges overlap, regardless of segment count.
 
-The overlap trigger exists because overlapping segments break the sorted-segments
-assumption that queries rely on: merging them eagerly keeps the persisted view coherent
-and avoids returning duplicates at query time.
+The overlap trigger exists so that each series' persisted chunks go back to being
+disjoint: a read of a series whose chunks overlap cannot stream them in timestamp order
+and has to collect, sort and deduplicate its points instead. Overlap is judged per series,
+from the chunk time ranges. Two segments whose overall time ranges intersect only because
+they hold different series (for example rollup rows stamped at the start of an older
+bucket next to fresh raw samples) do not trigger an early merge.
 
 Each `compact_once` call checks L0 first, then L1. Only one level is compacted per call.
 
@@ -53,9 +56,10 @@ Rather than compacting all available source segments at once, each pass selects 
 **window** of up to `DEFAULT_SOURCE_WINDOW_SEGMENTS` (8) segments. The selection
 algorithm:
 
-1. If any segments have overlapping time ranges, the algorithm identifies the smallest
-   cluster of overlapping segments and selects up to 8 of them by their original storage
-   order. This ensures overlaps are resolved before anything else.
+1. If any segments hold overlapping chunks of the same series, the algorithm groups the
+   segments linked by such overlaps and selects the group containing the oldest segment,
+   up to 8 of its segments in their original storage order. This ensures overlaps are
+   resolved before anything else.
 2. If there are no overlaps, the algorithm takes the oldest `count_trigger` (≥ 2)
    segments sorted by segment ID.
 

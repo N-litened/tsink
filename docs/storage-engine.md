@@ -305,7 +305,7 @@ Compaction runs in a background loop (default **every 5 seconds**) and follows a
 
 A compaction pass runs L0→L1 if either:
 - The number of L0 segments reaches `l0_trigger` (default **4**), or
-- Any two L0 segments have overlapping time ranges.
+- Any two L0 segments hold chunks of the same series with overlapping time ranges.
 
 Likewise for L1→L2 with `l1_trigger` (default **4**). A compaction window covers at most `source_window_segments` (default **8**) source segments per pass.
 

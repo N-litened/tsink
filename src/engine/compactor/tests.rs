@@ -89,6 +89,119 @@ fn compacts_overlapping_l0_segments_into_l1() {
 }
 
 #[test]
+fn segments_overlapping_only_across_different_series_are_not_compacted_early() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let raw = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let rollup = registry
+        .resolve_or_insert("cpu_rollup", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    let mut seg1_chunks = HashMap::new();
+    seg1_chunks.insert(
+        raw,
+        vec![make_numeric_chunk(raw, &[(100, 1.0), (110, 2.0)])],
+    );
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &seg1_chunks)
+        .unwrap();
+
+    let mut seg2_chunks = HashMap::new();
+    seg2_chunks.insert(
+        raw,
+        vec![make_numeric_chunk(raw, &[(120, 3.0), (130, 4.0)])],
+    );
+    seg2_chunks.insert(rollup, vec![make_numeric_chunk(rollup, &[(60, 5.0)])]);
+    SegmentWriter::new(temp_dir.path(), 0, 2)
+        .unwrap()
+        .write_segment(&registry, &seg2_chunks)
+        .unwrap();
+
+    let compactor = Compactor::new(temp_dir.path(), 8).with_level_triggers(4, 4);
+    assert!(!compactor.compact_once().unwrap());
+
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        2
+    );
+    assert!(load_segments_for_level(temp_dir.path(), 1)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn overlap_window_takes_only_segments_whose_series_overlap() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let raw = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let rollup = registry
+        .resolve_or_insert("cpu_rollup", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    let mut seg1_chunks = HashMap::new();
+    seg1_chunks.insert(
+        raw,
+        vec![make_numeric_chunk(raw, &[(100, 1.0), (110, 2.0)])],
+    );
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &seg1_chunks)
+        .unwrap();
+
+    let mut seg2_chunks = HashMap::new();
+    seg2_chunks.insert(
+        raw,
+        vec![make_numeric_chunk(raw, &[(120, 3.0), (130, 4.0)])],
+    );
+    seg2_chunks.insert(rollup, vec![make_numeric_chunk(rollup, &[(60, 5.0)])]);
+    SegmentWriter::new(temp_dir.path(), 0, 2)
+        .unwrap()
+        .write_segment(&registry, &seg2_chunks)
+        .unwrap();
+
+    let mut seg3_chunks = HashMap::new();
+    seg3_chunks.insert(
+        raw,
+        vec![make_numeric_chunk(raw, &[(125, 6.0), (140, 7.0)])],
+    );
+    SegmentWriter::new(temp_dir.path(), 0, 3)
+        .unwrap()
+        .write_segment(&registry, &seg3_chunks)
+        .unwrap();
+
+    let compactor = Compactor::new(temp_dir.path(), 8).with_level_triggers(4, 4);
+    assert!(compactor.compact_once().unwrap());
+
+    let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    assert_eq!(
+        l0.iter()
+            .map(|segment| segment.manifest.segment_id)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert_eq!(l1.len(), 1);
+    let merged = l1[0].chunks_by_series.get(&raw).unwrap();
+    let timestamps = merged
+        .iter()
+        .flat_map(|chunk| execution::decode_chunk_points_for_compaction(chunk).unwrap())
+        .map(|point| point.ts)
+        .collect::<Vec<_>>();
+    assert_eq!(timestamps, vec![120, 125, 130, 140]);
+}
+
+#[test]
 fn compaction_preserves_histogram_payloads() {
     let temp_dir = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();
@@ -198,7 +311,7 @@ fn compactor_limits_source_window_per_pass() {
             .unwrap();
     }
 
-    let compactor = Compactor::new(temp_dir.path(), 8);
+    let compactor = Compactor::new(temp_dir.path(), 8).with_level_triggers(4, 4);
     compactor.compact_once().unwrap();
 
     let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
@@ -238,7 +351,7 @@ fn compactor_splits_large_output_into_multiple_segments() {
             .unwrap();
     }
 
-    let compactor = Compactor::new(temp_dir.path(), 2);
+    let compactor = Compactor::new(temp_dir.path(), 2).with_level_triggers(4, 4);
     compactor.compact_once().unwrap();
 
     let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();

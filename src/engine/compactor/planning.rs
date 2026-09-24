@@ -47,13 +47,11 @@ impl Compactor {
 
         segments.sort_by_key(|segment| segment.manifest.segment_id);
 
-        let should_compact = segments.len() >= count_trigger || has_time_overlap(&segments);
-        if !should_compact {
+        let Some(window) =
+            select_compaction_window(&segments, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS)
+        else {
             return Ok(None);
-        }
-
-        let window =
-            select_compaction_window(&segments, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS);
+        };
         if window.len() < 2 {
             return Ok(None);
         }
@@ -109,118 +107,121 @@ pub(super) fn count_level_segments_for_compaction(base: &Path, level: u8) -> Res
     Ok(count)
 }
 
-pub(super) fn has_time_overlap(segments: &[LoadedSegment]) -> bool {
-    let mut ranges = segments
-        .iter()
-        .filter_map(|segment| {
-            Some((
-                segment.manifest.min_ts?,
-                segment.manifest.max_ts?,
-                segment.manifest.segment_id,
-            ))
-        })
-        .collect::<Vec<_>>();
-
-    if ranges.len() < 2 {
-        return false;
-    }
-
-    ranges.sort_by_key(|(min_ts, _, segment_id)| (*min_ts, *segment_id));
-
-    let mut current_max = ranges[0].1;
-    for (min_ts, max_ts, _) in ranges.into_iter().skip(1) {
-        if min_ts <= current_max {
-            return true;
-        }
-        current_max = current_max.max(max_ts);
-    }
-
-    false
-}
-
+/// Picks the source segments for one compaction pass, or `None` when the level
+/// does not need compacting yet.
+///
+/// Segments whose chunks of the same series overlap in time are merged first,
+/// regardless of the count trigger, so a series' persisted chunks go back to
+/// being disjoint. Overlap is judged per series: two segments whose overall time
+/// ranges intersect only because they hold different series (for example rollup
+/// rows stamped at the start of an older bucket next to fresh raw samples) do not
+/// count, since reads never have to reconcile their chunks.
 pub(super) fn select_compaction_window(
     segments: &[LoadedSegment],
     count_trigger: usize,
     max_segments: usize,
-) -> Vec<&LoadedSegment> {
+) -> Option<Vec<&LoadedSegment>> {
     let max_segments = max_segments.max(2);
-    if let Some(indexes) = overlapping_window_indexes(segments, max_segments) {
-        return indexes
-            .into_iter()
-            .filter_map(|index| segments.get(index))
-            .collect();
+    if let Some(indexes) = overlapping_series_window_indexes(segments, max_segments) {
+        return Some(
+            indexes
+                .into_iter()
+                .filter_map(|index| segments.get(index))
+                .collect(),
+        );
     }
 
-    let window_len = count_trigger.max(2).min(max_segments).min(segments.len());
-    segments.iter().take(window_len).collect()
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SegmentTimeRange {
-    index: usize,
-    segment_id: u64,
-    min_ts: i64,
-    max_ts: i64,
-}
-
-fn overlapping_window_indexes(
-    segments: &[LoadedSegment],
-    max_segments: usize,
-) -> Option<Vec<usize>> {
-    let mut ranges = segments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, segment)| {
-            Some(SegmentTimeRange {
-                index,
-                segment_id: segment.manifest.segment_id,
-                min_ts: segment.manifest.min_ts?,
-                max_ts: segment.manifest.max_ts?,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    if ranges.len() < 2 {
+    if segments.len() < count_trigger {
         return None;
     }
 
-    ranges.sort_by_key(|range| (range.min_ts, range.segment_id));
-
-    let mut cluster_start = 0usize;
-    let mut cluster_max = ranges[0].max_ts;
-
-    for idx in 1..ranges.len() {
-        if ranges[idx].min_ts <= cluster_max {
-            cluster_max = cluster_max.max(ranges[idx].max_ts);
-            continue;
-        }
-
-        if idx.saturating_sub(cluster_start) >= 2 {
-            return Some(select_cluster_indexes(
-                &ranges[cluster_start..idx],
-                max_segments,
-            ));
-        }
-
-        cluster_start = idx;
-        cluster_max = ranges[idx].max_ts;
-    }
-
-    if ranges.len().saturating_sub(cluster_start) >= 2 {
-        return Some(select_cluster_indexes(
-            &ranges[cluster_start..],
-            max_segments,
-        ));
-    }
-
-    None
+    let window_len = count_trigger.max(2).min(max_segments).min(segments.len());
+    Some(segments.iter().take(window_len).collect())
 }
 
-fn select_cluster_indexes(cluster: &[SegmentTimeRange], max_segments: usize) -> Vec<usize> {
-    let mut indexes = cluster.iter().map(|range| range.index).collect::<Vec<_>>();
-    indexes.sort_unstable();
-    indexes.truncate(max_segments.max(2));
-    indexes
+/// Groups segments that share a series whose chunks overlap in time and returns
+/// the group holding the oldest such segment, limited to `max_segments` members in
+/// storage order.
+fn overlapping_series_window_indexes(
+    segments: &[LoadedSegment],
+    max_segments: usize,
+) -> Option<Vec<usize>> {
+    let mut chunk_ranges_by_series = HashMap::<SeriesId, Vec<(i64, i64, usize)>>::new();
+    for (index, segment) in segments.iter().enumerate() {
+        for (series_id, chunks) in &segment.chunks_by_series {
+            chunk_ranges_by_series
+                .entry(*series_id)
+                .or_default()
+                .extend(
+                    chunks
+                        .iter()
+                        .filter(|chunk| chunk.header.point_count > 0)
+                        .map(|chunk| (chunk.header.min_ts, chunk.header.max_ts, index)),
+                );
+        }
+    }
+
+    let mut groups = SegmentGroups::new(segments.len());
+    for ranges in chunk_ranges_by_series.values_mut() {
+        ranges.sort_unstable();
+        let mut cluster: Option<(usize, i64)> = None;
+        for &(min_ts, max_ts, index) in ranges.iter() {
+            match cluster.as_mut() {
+                Some((first_index, cluster_max_ts)) if min_ts <= *cluster_max_ts => {
+                    groups.join(*first_index, index);
+                    *cluster_max_ts = (*cluster_max_ts).max(max_ts);
+                }
+                _ => cluster = Some((index, max_ts)),
+            }
+        }
+    }
+
+    let oldest = (0..segments.len()).find(|&index| groups.size_of(index) >= 2)?;
+    let root = groups.root(oldest);
+    let mut indexes = (0..segments.len())
+        .filter(|&index| groups.root(index) == root)
+        .collect::<Vec<_>>();
+    indexes.truncate(max_segments);
+    Some(indexes)
+}
+
+struct SegmentGroups {
+    parents: Vec<usize>,
+    sizes: Vec<usize>,
+}
+
+impl SegmentGroups {
+    fn new(len: usize) -> Self {
+        Self {
+            parents: (0..len).collect(),
+            sizes: vec![1; len],
+        }
+    }
+
+    fn root(&self, mut index: usize) -> usize {
+        while self.parents[index] != index {
+            index = self.parents[index];
+        }
+        index
+    }
+
+    fn size_of(&self, index: usize) -> usize {
+        self.sizes[self.root(index)]
+    }
+
+    fn join(&mut self, left: usize, right: usize) {
+        let (left, right) = (self.root(left), self.root(right));
+        if left == right {
+            return;
+        }
+        let (parent, child) = if self.sizes[left] >= self.sizes[right] {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        self.parents[child] = parent;
+        self.sizes[parent] += self.sizes[child];
+    }
 }
 
 pub(super) fn level_to_u8(level: CompactionLevel) -> u8 {
