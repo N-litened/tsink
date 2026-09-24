@@ -29,9 +29,9 @@ mod planning;
 
 pub(in crate::engine) use self::execution::finalize_pending_compaction_replacements;
 
-const DEFAULT_L0_TRIGGER: usize = 4;
-const DEFAULT_L1_TRIGGER: usize = 4;
-const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
+pub(in crate::engine) const DEFAULT_L0_TRIGGER: usize = 32;
+const DEFAULT_L1_TRIGGER: usize = 32;
+const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 64;
 const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;

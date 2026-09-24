@@ -1,8 +1,8 @@
 use super::{
     elapsed_nanos_u64, Arc, AtomicBool, AtomicU8, BackgroundWorkerSupervisorState, ChunkStorage,
     Compactor, Duration, Instant, Mutex, Ordering, PendingPersistedSegmentDiff, Result,
-    StorageObservabilityCounters, StorageRuntimeMode, TsinkError, DEFAULT_FLUSH_INTERVAL,
-    STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
+    StorageObservabilityCounters, StorageRuntimeMode, TsinkError,
+    DEFAULT_PERSISTED_REFRESH_POLL_INTERVAL, STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
 };
 
 #[path = "runtime/supervision.rs"]
@@ -196,11 +196,11 @@ impl ChunkStorage {
             return self
                 .persisted
                 .remote_segment_refresh_interval
-                .min(DEFAULT_FLUSH_INTERVAL)
+                .min(DEFAULT_PERSISTED_REFRESH_POLL_INTERVAL)
                 .max(Duration::from_millis(1));
         }
 
-        DEFAULT_FLUSH_INTERVAL
+        DEFAULT_PERSISTED_REFRESH_POLL_INTERVAL
     }
 
     fn spawn_background_rollup_thread(

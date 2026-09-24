@@ -35,7 +35,7 @@ a shared atomic counter.
 A compaction pass fires for a given level when either of the following is true:
 
 - **Count trigger** — the number of eligible segments at the source level reaches the
-  configured threshold (default **4** for both L0→L1 and L1→L2).
+  configured threshold (default **32** for both L0→L1 and L1→L2).
 - **Series overlap** — two segments at the source level hold chunks of the same series
   whose time ranges overlap, regardless of segment count.
 
@@ -53,12 +53,12 @@ Each `compact_once` call checks L0 first, then L1. Only one level is compacted p
 ## Window selection
 
 Rather than compacting all available source segments at once, each pass selects a
-**window** of up to `DEFAULT_SOURCE_WINDOW_SEGMENTS` (8) segments. The selection
+**window** of up to `DEFAULT_SOURCE_WINDOW_SEGMENTS` (64) segments. The selection
 algorithm:
 
 1. If any segments hold overlapping chunks of the same series, the algorithm groups the
    segments linked by such overlaps and selects the group containing the oldest segment,
-   up to 8 of its segments in their original storage order. This ensures overlaps are
+   up to 64 of its segments in their original storage order. This ensures overlaps are
    resolved before anything else.
 2. If there are no overlaps, the algorithm takes the oldest `count_trigger` (≥ 2)
    segments sorted by segment ID.
@@ -130,7 +130,7 @@ it does not, the replacement is treated as a corruption error.
 ## Background thread
 
 The compaction background thread runs continuously while the storage engine is open. It
-sleeps for `compaction_interval` (default **5 seconds**) between passes and wakes
+sleeps for `compaction_interval` (default **30 seconds**) between passes and wakes
 immediately when the flush pipeline signals that new segments have been written.
 
 The thread runs both the numeric compactor and the blob compactor in sequence on each
@@ -178,7 +178,7 @@ or tombstone removal is occurring over time.
 | `with_chunk_points(n)` | 2048 | Maximum points per chunk. Also controls the output segment size budget (`n × 512` points per output segment). Larger values produce fewer, bigger segments and reduce compaction frequency but increase per-segment memory and I/O cost. |
 
 There are no builder methods for the L0/L1 count triggers or the source window size; they
-are fixed at 4 and 8 respectively. The compaction interval is also fixed at 5 seconds in
+are fixed at 32 and 64 respectively. The compaction interval is also fixed at 30 seconds in
 the engine defaults.
 
 ---

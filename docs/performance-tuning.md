@@ -246,7 +246,7 @@ Match the partition duration to your typical query range. A common pattern is:
 
 ## 6. Compaction tuning
 
-Compaction merges L0 segments into L1, then L1 into L2. It runs in a background thread every **5 seconds**.
+Compaction merges L0 segments into L1, then L1 into L2. It runs in a background thread every **30 seconds**.
 
 ### Trigger thresholds
 
@@ -254,16 +254,16 @@ Two thresholds govern when a compaction pass fires for each level transition:
 
 | Threshold | Default | Effect |
 |---|---|---|
-| `l0_trigger` | 4 | Compact L0 → L1 when ≥ 4 L0 segments exist |
-| `l1_trigger` | 4 | Compact L1 → L2 when ≥ 4 L1 segments exist |
+| `l0_trigger` | 32 | Compact L0 → L1 when ≥ 32 L0 segments exist |
+| `l1_trigger` | 32 | Compact L1 → L2 when ≥ 32 L1 segments exist |
 
-Additionally, a compaction pass fires immediately for a level if any two segments in that level have **overlapping time ranges**, regardless of the count trigger. This keeps query read amplification low.
+Additionally, a compaction pass fires immediately for a level if two segments in that level hold chunks of the same series with **overlapping time ranges**, regardless of the count trigger. This keeps query read amplification low.
 
 These thresholds are not yet exposed as public API — increasing the flush frequency relative to the ingest rate is the easiest way to control L0 growth.
 
 ### Source window limit
 
-Each compaction pass merges at most **8 source segments** at a time. For burst-heavy workloads this keeps individual compaction jobs bounded. Back-to-back passes converge the level quickly.
+Each compaction pass merges at most **64 source segments** at a time. For burst-heavy workloads this keeps individual compaction jobs bounded. Back-to-back passes converge the level quickly.
 
 ### Monitoring compaction health
 

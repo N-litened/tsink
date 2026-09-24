@@ -400,18 +400,18 @@ tsink uses a three-level LSM-inspired compaction scheme.
 
 ```text
 Active chunks
-    │  background flush (250 ms default)
+    │  background flush (5 s default)
     ▼
-L0 segments    ← trigger: 4 L0 segments → compact → L1
+L0 segments    ← trigger: 32 L0 segments → compact → L1
     ▼
-L1 segments    ← trigger: 4 L1 segments → compact → L2
+L1 segments    ← trigger: 32 L1 segments → compact → L2
     ▼
 L2 segments    (cold-compacted, largest, longest time span)
 ```
 
 Each compaction pass:
 
-1. **Planning** (`compactor/planning.rs`) — selects a window of up to 8 source segments at the triggering level.
+1. **Planning** (`compactor/planning.rs`) — selects a window of up to 64 source segments at the triggering level.
 2. **Execution** (`compactor/execution.rs`) — merge-sorts all chunks, deduplicates overlapping samples, re-encodes with optimal codecs, writes new target-level segment.
 3. **Atomic replacement** — the replacement is staged in `.compaction-replacements/` and renamed into place. If the process crashes mid-replacement, `finalize_pending_compaction_replacements` cleans up the staging area at next startup.
 
@@ -666,8 +666,8 @@ The runtime (`src/engine/runtime.rs`) manages three background workers:
 
 | Worker     | Interval          | Activity                                                                               |
 | ---------- | ----------------- | -------------------------------------------------------------------------------------- |
-| Flush      | 250 ms            | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
-| Compaction | 5 s (+ triggered) | Runs `Compactor::compact_once` for numeric and blob lanes.                             |
+| Flush      | 5 s               | Flushes `BackgroundEligible` or `BackgroundBounded` active chunks to the sealed queue. |
+| Compaction | 30 s (+ triggered)| Runs `Compactor::compact_once` for numeric and blob lanes.                             |
 | Rollup     | 5 s               | Executes pending rollup materializations.                                              |
 
 Workers check three lifecycle states (`STORAGE_OPEN / CLOSING / CLOSED`) and stop themselves when the engine begins shutdown. If `background_fail_fast = true` (default), a background worker panic sets `fail_fast_triggered` and causes subsequent writes to return an error.
@@ -690,8 +690,8 @@ Key engine knobs and their defaults:
 | `memory_budget_bytes`                   | `u64::MAX` (no limit)   | Total in-memory chunk budget.                           |    |    |     |
 | `cardinality_limit`                     | `usize::MAX` (no limit) | Maximum unique series count.                            |    |    |     |
 | `chunk_points`                          | 2048                    | Points per sealed chunk.                                |    |    |     |
-| `compaction_interval`                   | 5 s                     | Background compaction frequency.                        |    |    |     |
-| `flush_interval`                        | 250 ms                  | Background flush frequency.                             |    |    |     |
+| `compaction_interval`                   | 30 s                    | Background compaction frequency.                        |    |    |     |
+| `flush_interval`                        | 5 s                     | Background flush frequency.                             |    |    |     |
 | `background_fail_fast`                  | `true`                  | Worker panic triggers engine failure mode.              |    |    |     |
 
 Container-aware defaults: `cgroup.rs` reads `/sys/fs/cgroup/cpu.max` and `/sys/fs/cgroup/memory.max` to detect CPU and memory limits. The `TSINK_MAX_CPUS` environment variable overrides the detected CPU count.

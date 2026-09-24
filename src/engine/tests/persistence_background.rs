@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::compactor::DEFAULT_L0_TRIGGER;
 use std::sync::mpsc;
 
 fn new_raw_numeric_storage(lane_path: std::path::PathBuf, next_segment_id: u64) -> ChunkStorage {
@@ -67,7 +68,7 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
         .unwrap()
         .series_id;
 
-    for segment_id in 1..=4 {
+    for segment_id in 1..=DEFAULT_L0_TRIGGER as u64 {
         let mut chunks = HashMap::new();
         chunks.insert(
             series_id,
@@ -87,7 +88,7 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
         None,
         Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
         None,
-        5,
+        DEFAULT_L0_TRIGGER as u64 + 1,
         ChunkStorageOptions {
             timestamp_precision: TimestampPrecision::Nanoseconds,
             retention_window: i64::MAX,
@@ -122,7 +123,7 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
     while Instant::now() < deadline {
         let l0 = load_segments_for_level(&lane_path, 0).unwrap();
         let l1 = load_segments_for_level(&lane_path, 1).unwrap();
-        if l0.len() < 4 && !l1.is_empty() {
+        if l0.len() < DEFAULT_L0_TRIGGER && !l1.is_empty() {
             compacted = true;
             break;
         }
@@ -149,7 +150,7 @@ fn background_compaction_refreshes_persisted_index_in_background() {
         .unwrap()
         .series_id;
 
-    for segment_id in 1..=4 {
+    for segment_id in 1..=DEFAULT_L0_TRIGGER as u64 {
         let mut chunks = HashMap::new();
         chunks.insert(
             series_id,
@@ -170,7 +171,7 @@ fn background_compaction_refreshes_persisted_index_in_background() {
             None,
             Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
             None,
-            5,
+            DEFAULT_L0_TRIGGER as u64 + 1,
             ChunkStorageOptions {
                 timestamp_precision: TimestampPrecision::Nanoseconds,
                 retention_window: i64::MAX,
@@ -209,7 +210,7 @@ fn background_compaction_refreshes_persisted_index_in_background() {
     while Instant::now() < deadline {
         let l0 = load_segments_for_level(&lane_path, 0).unwrap();
         let l1 = load_segments_for_level(&lane_path, 1).unwrap();
-        if l0.len() < 4 && !l1.is_empty() {
+        if l0.len() < DEFAULT_L0_TRIGGER && !l1.is_empty() {
             compacted = true;
             break;
         }
@@ -251,9 +252,14 @@ fn background_compaction_refreshes_persisted_index_in_background() {
     );
 
     let points = storage
-        .select("background_compaction_sync", &labels, 0, 10)
+        .select(
+            "background_compaction_sync",
+            &labels,
+            0,
+            DEFAULT_L0_TRIGGER as i64 + 1,
+        )
         .unwrap();
-    assert_eq!(points.len(), 4);
+    assert_eq!(points.len(), DEFAULT_L0_TRIGGER);
 
     let persisted_levels = storage
         .persisted
@@ -288,7 +294,7 @@ fn flush_pipeline_reconciles_known_dirty_compaction_changes_before_checkpointing
         .unwrap()
         .series_id;
 
-    for segment_id in 1..=4 {
+    for segment_id in 1..=DEFAULT_L0_TRIGGER as u64 {
         let mut chunks = HashMap::new();
         chunks.insert(
             series_id,
@@ -308,7 +314,7 @@ fn flush_pipeline_reconciles_known_dirty_compaction_changes_before_checkpointing
         None,
         Some(lane_path.clone()),
         None,
-        5,
+        DEFAULT_L0_TRIGGER as u64 + 1,
         ChunkStorageOptions {
             retention_enforced: false,
             compaction_interval: Duration::from_millis(25),
@@ -345,17 +351,22 @@ fn flush_pipeline_reconciles_known_dirty_compaction_changes_before_checkpointing
         .insert_rows(&[Row::with_labels(
             "flush_known_dirty_compaction",
             labels.clone(),
-            DataPoint::new(10, 10.0),
+            DataPoint::new(DEFAULT_L0_TRIGGER as i64 + 10, 10.0),
         )])
         .unwrap();
     storage.flush_pipeline_once().unwrap();
 
     assert_eq!(
         storage
-            .select("flush_known_dirty_compaction", &labels, 0, 20)
+            .select(
+                "flush_known_dirty_compaction",
+                &labels,
+                0,
+                DEFAULT_L0_TRIGGER as i64 + 20,
+            )
             .unwrap()
             .len(),
-        5
+        DEFAULT_L0_TRIGGER + 1
     );
 
     storage.close().unwrap();
