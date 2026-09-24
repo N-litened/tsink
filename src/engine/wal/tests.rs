@@ -864,6 +864,55 @@ fn write_published_while_a_reset_finishes_survives_a_later_rollback() {
     assert_eq!(replayed_series_ids(&wal), vec![10]);
 }
 
+fn single_sample_batch(ts: i64) -> SamplesBatchFrame {
+    SamplesBatchFrame::from_points(
+        1,
+        ValueLane::Numeric,
+        &[ChunkPoint {
+            ts,
+            value: Value::F64(ts as f64),
+        }],
+    )
+    .unwrap()
+}
+
+#[test]
+fn reopened_wal_numbers_frames_above_its_publish_marker() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        for ts in 1..=3 {
+            wal.append_samples(&[single_sample_batch(ts)]).unwrap();
+        }
+        wal.reset().unwrap();
+    }
+
+    let first_write_after_reopen = {
+        let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+        wal.append_samples(&[single_sample_batch(4)]).unwrap();
+        let highwater = wal.current_highwater();
+        wal.reset().unwrap();
+        wal.append_samples(&[single_sample_batch(5)]).unwrap();
+        highwater
+    };
+
+    let wal = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    let replayed: Vec<i64> = wal
+        .replay_committed_writes()
+        .unwrap()
+        .iter()
+        .flat_map(|write| write.sample_batches.iter().map(|batch| batch.base_ts))
+        .collect();
+    assert_eq!(replayed, vec![5]);
+    assert_eq!(
+        first_write_after_reopen,
+        WalHighWatermark {
+            segment: 0,
+            frame: 4
+        }
+    );
+}
+
 #[test]
 fn ensure_min_next_seq_sets_sequence_floor() {
     let temp_dir = TempDir::new().unwrap();

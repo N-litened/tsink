@@ -155,6 +155,10 @@ impl FramedWal {
         if existing_published_highwater.is_none() {
             wal.persist_published_highwater(published_highwater, true)?;
         }
+        // A reset leaves an empty segment behind, so the scan alone would number frames from 1
+        // again. Frames at or below the publish marker would then neither advance the marker nor,
+        // once a reset rewrote it lower, be replayed after a crash.
+        wal.ensure_min_highwater(published_highwater)?;
 
         Ok(wal)
     }
