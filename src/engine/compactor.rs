@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 
 #[path = "compactor/execution.rs"]
 mod execution;
+#[path = "compactor/final_level.rs"]
+mod final_level;
 #[path = "compactor/planning.rs"]
 mod planning;
 

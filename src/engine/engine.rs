@@ -627,5 +627,18 @@ pub fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Path) -> 
     bootstrap::restore_storage_from_snapshot(snapshot_path, data_path)
 }
 
+pub fn compact_final_level_offline(
+    data_path: &Path,
+    chunk_points: usize,
+    window: Duration,
+    timestamp_precision: TimestampPrecision,
+) -> Result<crate::engine::compactor::CompactionRunStats> {
+    maintenance::compact_final_level_offline(
+        data_path,
+        chunk_points,
+        duration_to_timestamp_units(window, timestamp_precision),
+    )
+}
+
 #[cfg(test)]
 mod tests;

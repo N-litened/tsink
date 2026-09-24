@@ -62,6 +62,7 @@ mod admission_control;
 mod capacity;
 mod deletion;
 mod failure_modes;
+mod final_level_compaction;
 mod ingest_concurrency;
 mod ingest_core;
 mod ingest_failures;

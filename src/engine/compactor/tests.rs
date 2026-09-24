@@ -592,3 +592,171 @@ fn make_histogram_chunk(series_id: u64, timestamps: &[i64]) -> Chunk {
         wal_highwater: WalHighWatermark::default(),
     }
 }
+
+fn final_level_segment(
+    segment_id: u64,
+    min_ts: i64,
+    max_ts: i64,
+    point_count: usize,
+) -> super::final_level::FinalLevelSegment {
+    super::final_level::FinalLevelSegment {
+        root: std::path::PathBuf::from(format!("seg-{segment_id:016x}")),
+        manifest: crate::engine::segment::SegmentManifest {
+            segment_id,
+            level: 2,
+            chunk_count: 1,
+            point_count,
+            series_count: 1,
+            min_ts: Some(min_ts),
+            max_ts: Some(max_ts),
+            wal_highwater: WalHighWatermark::default(),
+        },
+    }
+}
+
+#[test]
+fn final_level_merge_groups_small_segments_by_the_window_of_their_newest_point() {
+    let segments = vec![
+        final_level_segment(1, 150, 190, 100),
+        final_level_segment(2, 10, 90, 100),
+        final_level_segment(3, 20, 95, 600),
+        final_level_segment(4, 50, 99, 100),
+        final_level_segment(5, 60, 120, 100),
+    ];
+
+    assert_eq!(
+        super::final_level::select_final_level_merge(&segments, 100, 1_000, 64),
+        Some(vec![1, 3])
+    );
+}
+
+#[test]
+fn final_level_merge_stops_at_the_point_budget_or_the_source_limit() {
+    let segments = (0..10)
+        .map(|segment_id| final_level_segment(segment_id, 10 - segment_id as i64, 50, 300))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        super::final_level::select_final_level_merge(&segments, 100, 1_000, 64),
+        Some(vec![9, 8, 7, 6])
+    );
+    assert_eq!(
+        super::final_level::select_final_level_merge(&segments, 100, 1_000, 3),
+        Some(vec![9, 8, 7])
+    );
+}
+
+#[test]
+fn final_level_merge_needs_two_small_segments_in_one_window() {
+    let segments = vec![
+        final_level_segment(1, 0, 50, 100),
+        final_level_segment(2, 100, 150, 100),
+        final_level_segment(3, 0, 60, 900),
+    ];
+
+    assert_eq!(
+        super::final_level::select_final_level_merge(&segments, 100, 1_000, 64),
+        None
+    );
+}
+
+#[test]
+fn compacting_the_final_level_merges_small_segments_per_window_and_keeps_every_point() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let first = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let second = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "b")])
+        .unwrap()
+        .series_id;
+
+    let mut expected = HashMap::<u64, Vec<i64>>::new();
+    let mut write = |level: u8, segment_id: u64, timestamps: &[i64]| {
+        let mut chunks = HashMap::new();
+        for series_id in [first, second] {
+            let points = timestamps
+                .iter()
+                .map(|ts| (*ts, (*ts + series_id as i64) as f64))
+                .collect::<Vec<_>>();
+            chunks.insert(series_id, vec![make_numeric_chunk(series_id, &points)]);
+            expected
+                .entry(series_id)
+                .or_default()
+                .extend_from_slice(timestamps);
+        }
+        SegmentWriter::new(temp_dir.path(), level, segment_id)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    };
+    for segment_id in 1..=5 {
+        let ts = segment_id as i64 * 100;
+        write(2, segment_id, &[ts, ts + 10]);
+    }
+    write(2, 6, &[1_100, 1_110]);
+    write(2, 7, &[1_200, 1_210]);
+    write(2, 8, &[2_500]);
+    write(0, 20, &[3_000]);
+
+    let compactor =
+        Compactor::new_with_segment_id_allocator(temp_dir.path(), 8, Arc::new(AtomicU64::new(21)));
+    let (mut segments, max_segment_id) = compactor.scan_final_level_segments().unwrap();
+    assert_eq!(max_segment_id, Some(20));
+    assert_eq!(segments.len(), 8);
+
+    let mut merges = 0;
+    loop {
+        let stats = compactor
+            .compact_final_level_once(&mut segments, 1_000)
+            .unwrap();
+        if !stats.compacted {
+            break;
+        }
+        assert_eq!(stats.source_level, Some(2));
+        assert_eq!(stats.target_level, Some(2));
+        merges += 1;
+    }
+    assert_eq!(merges, 2);
+
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    let mut l2_ids = l2
+        .iter()
+        .map(|segment| segment.manifest.segment_id)
+        .collect::<Vec<_>>();
+    l2_ids.sort_unstable();
+    assert_eq!(l2_ids, vec![8, 21, 22]);
+    let mut tracked = segments
+        .iter()
+        .map(|segment| segment.manifest.segment_id)
+        .collect::<Vec<_>>();
+    tracked.sort_unstable();
+    assert_eq!(tracked, l2_ids);
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        1
+    );
+
+    let loaded = load_segments(temp_dir.path()).unwrap();
+    for (series_id, mut timestamps) in expected {
+        timestamps.sort_unstable();
+        let mut stored = loaded
+            .chunks_by_series
+            .get(&series_id)
+            .unwrap()
+            .iter()
+            .flat_map(|chunk| execution::decode_chunk_points_for_compaction(chunk).unwrap())
+            .map(|point| {
+                assert_eq!(
+                    point.value,
+                    Value::F64((point.ts + series_id as i64) as f64)
+                );
+                point.ts
+            })
+            .collect::<Vec<_>>();
+        stored.sort_unstable();
+        assert_eq!(stored, timestamps);
+    }
+}

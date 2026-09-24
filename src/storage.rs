@@ -1287,6 +1287,38 @@ impl StorageBuilder {
         crate::engine::restore_storage_from_snapshot(snapshot_path.as_ref(), data_path.as_ref())
     }
 
+    /// Merges the small segments of the final compaction level (L2) in the store
+    /// at the configured data path, which must not be open in any process.
+    ///
+    /// Regular compaction never merges L2 segments, so a store that receives a
+    /// steady trickle of writes accumulates many small ones until retention
+    /// removes them. This merges L2 segments below half the output segment size
+    /// whose newest points fall in the same `window`-aligned span (for example one
+    /// day), so merged data still expires together. Uses the configured chunk
+    /// points and timestamp precision; tiered and compute-only stores are not
+    /// supported.
+    pub fn compact_final_level(
+        self,
+        window: Duration,
+    ) -> Result<crate::engine::compactor::CompactionRunStats> {
+        let Some(data_path) = self.data_path.as_deref() else {
+            return Err(TsinkError::InvalidConfiguration(
+                "final-level compaction requires a data path".to_string(),
+            ));
+        };
+        if self.object_store_path.is_some() || self.runtime_mode != StorageRuntimeMode::ReadWrite {
+            return Err(TsinkError::InvalidConfiguration(
+                "final-level compaction supports only local read-write stores".to_string(),
+            ));
+        }
+        crate::engine::compact_final_level_offline(
+            data_path,
+            self.chunk_points,
+            window,
+            self.timestamp_precision,
+        )
+    }
+
     pub(crate) fn chunk_points(&self) -> usize {
         self.chunk_points
     }

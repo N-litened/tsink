@@ -20,8 +20,9 @@ three levels:
 
 Segments at the same level are independent: they may cover overlapping or non-overlapping
 time ranges and may belong to different series. The compactor merges segments within a
-level and writes the output one level higher. There is no compaction out of L2; L2
-segments age out only through retention expiry.
+level and writes the output one level higher. There is no background compaction out of
+L2; L2 segments age out through retention expiry, or can be merged offline (see
+[Offline final-level compaction](#offline-final-level-compaction)).
 
 The engine maintains two separate compactors — one for the **numeric lane** (float64
 series) and one for the **blob lane** (bytes and native histograms). Each compactor
@@ -144,6 +145,32 @@ shutting down background threads.
 When `background_fail_fast` is enabled (the default), a compaction error marks the
 storage engine as unhealthy and causes subsequent write and flush operations to return
 an error.
+
+---
+
+## Offline final-level compaction
+
+A store that receives a steady trickle of writes accumulates many small L2 segments,
+because background compaction never merges L2. `StorageBuilder::compact_final_level(window)`
+merges them in a store that is not open in any process (it holds the data path lock for
+the whole run and fails if the store is open):
+
+```rust
+let stats = StorageBuilder::new()
+    .with_data_path("./tsink-data")
+    .with_timestamp_precision(TimestampPrecision::Milliseconds)
+    .compact_final_level(Duration::from_secs(24 * 3600))?;
+```
+
+L2 segments below half the output segment point budget (`chunk_point_cap × 256`) are
+grouped by the `window`-aligned span holding their newest point, so merged data still
+expires together. Within the earliest window that holds at least two of them, sources are
+taken oldest data first until they reach the point budget or 64 segments, and merged
+through the regular crash-safe replacement protocol into new L2 segments. Every merge
+writes fewer segments than it removes, and merging repeats until no window has two small
+segments left. Tiered and compute-only stores are not supported. The registry catalog
+sidecar no longer matches afterwards, so the next open rebuilds startup metadata from the
+segments once.
 
 ---
 

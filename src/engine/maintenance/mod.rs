@@ -5,6 +5,7 @@
 
 mod budget_enforcement;
 mod catalog_refresh;
+mod final_level;
 mod memory_accounting;
 mod post_flush;
 mod registry_persistence;
@@ -15,6 +16,7 @@ use std::sync::atomic::Ordering;
 
 use parking_lot::RwLockWriteGuard;
 
+pub(super) use self::final_level::compact_final_level_offline;
 use super::registry_catalog;
 use super::tiering::SegmentInventory;
 use super::*;
