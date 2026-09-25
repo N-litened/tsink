@@ -567,13 +567,14 @@ impl ControlConsensusRuntime {
         rpc_client: &RpcClient,
         command: InternalControlCommand,
     ) -> Result<ProposeOutcome, String> {
-        let (request, proposal_index, proposal_term, quorum, peers) = {
+        let (request, proposal_index, proposal_term, quorum, peers, voters) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let quorum = self.quorum_size_locked(&state);
             let peers = self.control_peer_nodes_locked(&state);
+            let voters = self.control_voter_node_ids_locked(&state);
             self.validate_local_proposal_locked(&state, &command, unix_timestamp_millis())?;
             let (entry, prev_log_index, prev_log_term, leader_commit_before) =
                 self.prepare_proposal_locked(&mut state, command)?;
@@ -591,10 +592,13 @@ impl ControlConsensusRuntime {
                 entries: vec![entry.clone()],
                 leader_commit: leader_commit_before,
             };
-            (request, entry.index, entry.term, quorum, peers)
+            (request, entry.index, entry.term, quorum, peers, voters)
         };
 
-        let mut acknowledged = 1usize;
+        // Joining and Leaving peers still receive the entry, but only Active nodes count
+        // toward the quorum, which is a majority of them.
+        let is_voter = |node_id: &str| voters.iter().any(|voter| voter == node_id);
+        let mut acknowledged = usize::from(is_voter(&self.local_node_id));
         let mut acknowledged_peers = Vec::new();
         let mut highest_remote_term = 0u64;
         let mut tasks = tokio::task::JoinSet::new();
@@ -616,7 +620,9 @@ impl ControlConsensusRuntime {
                         highest_remote_term = response.term;
                     }
                     if response.success {
-                        acknowledged += 1;
+                        if is_voter(&node_id) {
+                            acknowledged += 1;
+                        }
                         acknowledged_peers.push(node_id);
                     }
                 }
@@ -2790,6 +2796,101 @@ mod tests {
         assert_eq!(
             runtime.current_state().leader_node_id.as_deref(),
             Some("node-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn acks_from_non_voting_peers_do_not_count_toward_the_quorum() {
+        use crate::http::{read_http_request, write_http_response, HttpResponse};
+
+        // node-c is Leaving but acknowledges everything; node-b is down.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let leaving_endpoint = listener.local_addr().unwrap().to_string();
+        let leaving_peer = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut read_buffer = Vec::new();
+                let Ok(request) = read_http_request(&mut stream, &mut read_buffer).await else {
+                    continue;
+                };
+                let append: InternalControlAppendRequest =
+                    serde_json::from_slice(&request.body).expect("append should decode");
+                let response = InternalControlAppendResponse {
+                    term: append.term,
+                    success: true,
+                    match_index: append.prev_log_index + append.entries.len() as u64,
+                    message: None,
+                };
+                let response = HttpResponse::new(200, serde_json::to_vec(&response).unwrap())
+                    .with_header("Content-Type", "application/json");
+                let _ = write_http_response(&mut stream, &response).await;
+            }
+        });
+        let down_endpoint = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let node_b = format!("node-b@{down_endpoint}");
+        let node_c = format!("node-c@{leaving_endpoint}");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-a",
+            "127.0.0.1:9391",
+            &[node_b.as_str(), node_c.as_str()],
+            "node-a",
+            64,
+        );
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.control_state.leader_node_id = Some("node-b".to_string());
+            state.last_leader_contact_unix_ms = 0;
+            state
+                .control_state
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == "node-c")
+                .unwrap()
+                .status = ControlNodeStatus::Leaving;
+        }
+        let rpc_client = RpcClient::new(RpcClientConfig {
+            timeout: Duration::from_millis(200),
+            max_retries: 0,
+            protocol_version: INTERNAL_RPC_PROTOCOL_VERSION.to_string(),
+            internal_auth_token: "token".to_string(),
+            internal_auth_runtime: None,
+            local_node_id: "node-a".to_string(),
+            compatibility: crate::cluster::rpc::CompatibilityProfile::default(),
+            internal_mtls: None,
+        });
+
+        let outcome = runtime
+            .propose_command(
+                &rpc_client,
+                InternalControlCommand::SetLeader {
+                    leader_node_id: "node-a".to_string(),
+                },
+            )
+            .await
+            .expect("proposal should return");
+        leaving_peer.abort();
+        assert!(
+            matches!(
+                outcome,
+                ProposeOutcome::Pending {
+                    required: 2,
+                    acknowledged: 1
+                }
+            ),
+            "{outcome:?}"
         );
     }
 
