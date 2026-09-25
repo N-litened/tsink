@@ -103,7 +103,6 @@ const CLI_ENDPOINTS_HELP: &str = r#"Endpoints:
 #[derive(Debug, Parser)]
 #[command(
     name = "tsink-server",
-    bin_name = "tsink-server server",
     version,
     about = env!("CARGO_PKG_DESCRIPTION"),
     long_about = None,
@@ -676,6 +675,15 @@ fn parse_cluster_read_partial_response_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_names_the_installed_binary() {
+        use clap::CommandFactory;
+
+        let usage = ServerCliArgs::command().render_usage().to_string();
+        assert!(usage.contains("tsink-server [OPTIONS]"), "{usage}");
+        assert!(!usage.contains("tsink-server server"), "{usage}");
+    }
 
     #[test]
     fn parse_duration_rejects_non_finite_values() {
