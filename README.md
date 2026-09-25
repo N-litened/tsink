@@ -20,7 +20,7 @@
 - **Tiered storage** — hot, warm, and cold tiers with automatic lifecycle management and optional object-store backing.
 - **Drop-in protocol support** — accepts Prometheus remote write/read, InfluxDB line protocol, OTLP, StatsD, and Graphite out of the box.
 - **Built-in PromQL** — query your data with a native PromQL parser and evaluator. No external query layer needed.
-- **Secure by default** — TLS (rustls, no OpenSSL), RBAC with OIDC, multi-tenant isolation, and mTLS between cluster nodes.
+- **Security controls built in** — TLS (rustls, no OpenSSL), bearer tokens, RBAC with OIDC, multi-tenant isolation, and mTLS between cluster nodes. They are opt-in: by default the server listens on localhost over plain HTTP without authentication. See [Security](docs/security.md) to enable them.
 - **Zero external dependencies at runtime** — single static binary for the server; `protoc` is vendored at build time.
 
 ---
