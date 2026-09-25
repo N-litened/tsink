@@ -836,6 +836,11 @@ impl ControlConsensusRuntime {
             });
         }
 
+        // Only entries this request matched against the leader's log may be committed; a
+        // longer local tail can still be a stale leader's.
+        let last_new_index = request
+            .prev_log_index
+            .saturating_add(request.entries.len() as u64);
         let mut expected_index = request.prev_log_index.saturating_add(1);
         for entry in request.entries {
             if entry.index != expected_index {
@@ -900,8 +905,9 @@ impl ControlConsensusRuntime {
         }
 
         let last_index = self.last_log_index_locked(&state);
-        if request.leader_commit > state.commit_index {
-            state.commit_index = std::cmp::min(request.leader_commit, last_index);
+        let commit_index = request.leader_commit.min(last_new_index);
+        if commit_index > state.commit_index {
+            state.commit_index = commit_index;
             self.apply_committed_entries_locked(&mut state)?;
         }
         self.persist_log_locked(&state)?;
@@ -2896,6 +2902,49 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn follower_commits_only_entries_the_append_matched() {
+        let temp_dir = TempDir::new().expect("temp dir should create");
+        let runtime = open_runtime_for_node(
+            &temp_dir,
+            "node-b",
+            "127.0.0.1:9392",
+            &["node-a@127.0.0.1:9391"],
+            "node-b",
+            64,
+        );
+        let set_leader = |index: u64| InternalControlLogEntry {
+            index,
+            term: 2,
+            command: InternalControlCommand::SetLeader {
+                leader_node_id: "node-a".to_string(),
+            },
+            created_unix_ms: index,
+        };
+        let append = |prev_log_index: u64, entries: Vec<InternalControlLogEntry>, leader_commit| {
+            runtime
+                .handle_append_request(InternalControlAppendRequest {
+                    term: 2,
+                    leader_node_id: "node-a".to_string(),
+                    prev_log_index,
+                    prev_log_term: if prev_log_index == 0 { 0 } else { 2 },
+                    entries,
+                    leader_commit,
+                })
+                .expect("append should succeed")
+        };
+        assert!(append(0, vec![set_leader(1), set_leader(2)], 0).success);
+
+        // A heartbeat that matched only index 1 cannot commit index 2.
+        assert!(append(1, Vec::new(), 2).success);
+        let commit_index = runtime
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit_index;
+        assert_eq!(commit_index, 1);
     }
 
     #[test]
