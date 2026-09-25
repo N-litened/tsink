@@ -689,11 +689,15 @@ impl ControlConsensusRuntime {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.control_peer_nodes_locked(&state)
         };
-        for (_node_id, endpoint) in commit_peers {
+        // A follower that misses this notice learns the commit index from the reconciler's
+        // next heartbeat, which carries leader_commit.
+        for (node_id, endpoint) in commit_peers {
             let rpc_client = rpc_client.clone();
             let request = commit_notice.clone();
             tasks.spawn(async move {
-                let _ = rpc_client.control_append(&endpoint, &request).await;
+                if let Err(err) = rpc_client.control_append(&endpoint, &request).await {
+                    eprintln!("control commit notice to {node_id} failed: {err}");
+                }
             });
         }
         while let Some(result) = tasks.join_next().await {
