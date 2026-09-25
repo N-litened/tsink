@@ -819,6 +819,139 @@ fn invalidated_rollups_stay_raw_for_later_windows_until_rebuilt() {
     storage.close().unwrap();
 }
 
+fn host_labels(hosts: usize) -> Vec<Vec<Label>> {
+    (0..hosts)
+        .map(|host| vec![Label::new("host", host.to_string())])
+        .collect()
+}
+
+fn write_cpu_usage(storage: &ChunkStorage, hosts: &[Vec<Label>], from: i64, to: i64, step: usize) {
+    let rows = hosts
+        .iter()
+        .flat_map(|labels| {
+            (from..=to).step_by(step).map(|ts| {
+                Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(ts, ts as f64))
+            })
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+}
+
+fn count_rollup_state_persists(storage: &ChunkStorage) -> Arc<std::sync::atomic::AtomicUsize> {
+    let persists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    storage.set_rollup_state_persist_hook({
+        let persists = Arc::clone(&persists);
+        move || {
+            persists.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+    persists
+}
+
+fn last_rollup_bucket(storage: &ChunkStorage, metric: &str, labels: &[Label]) -> Option<i64> {
+    storage
+        .select(metric, labels, 0, i64::MAX)
+        .unwrap()
+        .last()
+        .map(|point| point.timestamp)
+}
+
+#[test]
+fn a_rollup_pass_writes_its_state_once_for_every_source_with_new_buckets() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_rollup_storage(temp_dir.path());
+    let policy = cpu_rollup_policy("cpu_2s_avg", 2_000);
+    let rollup_metric = rollup_metric_name(&policy.id, 0, &policy.metric);
+    let hosts = host_labels(8);
+    write_cpu_usage(&storage, &hosts, 0, 4_000, 1_000);
+    storage.apply_rollup_policies(vec![policy]).unwrap();
+    write_cpu_usage(&storage, &hosts, 5_000, 8_000, 1_000);
+
+    let persists = count_rollup_state_persists(&storage);
+    storage.trigger_rollup_run().unwrap();
+    storage.clear_rollup_state_persist_hook();
+
+    assert_eq!(
+        persists.load(Ordering::SeqCst),
+        2,
+        "one write stages every source with new buckets, one records the checkpoints"
+    );
+    for labels in &hosts {
+        assert_eq!(
+            last_rollup_bucket(&storage, &rollup_metric, labels),
+            Some(6_000)
+        );
+    }
+    storage.close().unwrap();
+}
+
+#[test]
+fn a_rollup_pass_stages_a_large_backfill_in_bounded_batches() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_rollup_storage(temp_dir.path());
+    let policy = cpu_rollup_policy("cpu_1ms_avg", 1);
+    let rollup_metric = rollup_metric_name(&policy.id, 0, &policy.metric);
+    let hosts = host_labels(4);
+    storage.apply_rollup_policies(vec![policy]).unwrap();
+    write_cpu_usage(&storage, &hosts, 0, 22_000, 1);
+
+    let persists = count_rollup_state_persists(&storage);
+    storage.trigger_rollup_run().unwrap();
+    storage.clear_rollup_state_persist_hook();
+
+    assert_eq!(
+        persists.load(Ordering::SeqCst),
+        3,
+        "three hosts reach the staging bound, the fourth is staged with the pass's end, then the checkpoints"
+    );
+    for labels in &hosts {
+        let buckets = storage.select(&rollup_metric, labels, 0, i64::MAX).unwrap();
+        assert_eq!(buckets.len(), 22_000);
+        assert_eq!(buckets.last().map(|point| point.timestamp), Some(21_999));
+    }
+    storage.close().unwrap();
+}
+
+#[test]
+fn a_rollup_pass_that_cannot_stage_writes_no_bucket() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_rollup_storage(temp_dir.path());
+    let policy = cpu_rollup_policy("cpu_2s_avg", 2_000);
+    let rollup_metric = rollup_metric_name(&policy.id, 0, &policy.metric);
+    let hosts = host_labels(8);
+    write_cpu_usage(&storage, &hosts, 0, 4_000, 1_000);
+    storage.apply_rollup_policies(vec![policy]).unwrap();
+    write_cpu_usage(&storage, &hosts, 5_000, 8_000, 1_000);
+
+    storage.set_rollup_state_persist_hook(|| {
+        Err(TsinkError::Other(
+            "injected rollup state persist failure".to_string(),
+        ))
+    });
+    let err = storage.trigger_rollup_run().unwrap_err();
+    storage.clear_rollup_state_persist_hook();
+
+    assert!(err
+        .to_string()
+        .contains("injected rollup state persist failure"));
+    for labels in &hosts {
+        assert_eq!(
+            last_rollup_bucket(&storage, &rollup_metric, labels),
+            Some(2_000)
+        );
+    }
+    let snapshot = storage.trigger_rollup_run().unwrap();
+    assert_eq!(snapshot.policies[0].materialized_through, Some(8_000));
+    for labels in &hosts {
+        assert_eq!(
+            last_rollup_bucket(&storage, &rollup_metric, labels),
+            Some(6_000)
+        );
+    }
+    storage.close().unwrap();
+}
+
 #[test]
 fn historical_backfill_rollup_state_persist_failure_aborts_before_raw_commit() {
     let temp_dir = TempDir::new().unwrap();

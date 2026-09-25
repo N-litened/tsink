@@ -8,21 +8,27 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Upper bound on the rollup buckets a pass computes before it stages them. One staging write
+/// of the rollup state covers every source in the batch, so a pass rewrites the state file once
+/// per batch rather than once per source, while a large backfill holds only one batch of buckets
+/// in memory (or one source's, when a single source has more).
+const ROLLUP_STAGING_BATCH_POINTS: usize = 65_536;
+
 impl RollupStateStoreContext<'_> {
-    fn stage_pending_rollup_materialization(
+    fn stage_pending_rollup_materializations<'p>(
         self,
-        policy_id: &str,
-        source_key: &str,
-        pending: PendingRollupMaterialization,
+        staged: impl IntoIterator<Item = (&'p str, &'p str, PendingRollupMaterialization)>,
     ) -> Result<()> {
         let checkpoints = self.checkpoints_snapshot();
         let generations = self.generations_snapshot();
         let mut pending_materializations = self.pending_materializations_snapshot();
         let pending_delete_invalidations = self.pending_delete_invalidations_snapshot();
-        pending_materializations
-            .entry(policy_id.to_string())
-            .or_default()
-            .insert(source_key.to_string(), pending);
+        for (policy_id, source_key, pending) in staged {
+            pending_materializations
+                .entry(policy_id.to_string())
+                .or_default()
+                .insert(source_key.to_string(), pending);
+        }
         self.persist_state_snapshot(
             &checkpoints,
             &generations,
@@ -215,149 +221,341 @@ impl RollupInvalidationContext<'_> {
     }
 }
 
-fn run_rollup_policy_once(
-    store: RollupStateStoreContext<'_>,
-    source_reads: RollupSourceReadContext<'_>,
-    materialized_writes: RollupMaterializedWriteContext<'_>,
-    policy: &RollupPolicy,
-    max_observed: i64,
-) -> Result<PolicyRunReport> {
-    let sources = source_reads.matching_rollup_sources(policy)?;
-    let mut report = PolicyRunReport {
-        matched_series: u64::try_from(sources.len()).unwrap_or(u64::MAX),
-        ..PolicyRunReport::default()
-    };
+/// Buckets computed for one source, waiting to be staged and written.
+struct PlannedRollupSource {
+    policy: usize,
+    source: RollupSourceSeries,
+    rollup_metric: String,
+    pending: PendingRollupMaterialization,
+    points: Vec<DataPoint>,
+}
 
-    let Some(stable_end) = aligned_materialized_end(policy, max_observed) else {
-        return Ok(report);
-    };
+struct PolicyRun {
+    started: Instant,
+    started_at_ms: u64,
+    finished: Instant,
+    report: PolicyRunReport,
+    source_keys: Vec<String>,
+    error: Option<String>,
+}
 
-    let generation = store.policy_generation(&policy.id);
-    let rollup_metric = rollup_metric_name(policy, generation);
-    let existing_checkpoints = store
-        .state
-        .checkpoints
-        .read()
-        .get(&policy.id)
-        .cloned()
-        .unwrap_or_default();
-    let existing_pending = store
-        .state
-        .pending_materializations
-        .read()
-        .get(&policy.id)
-        .cloned()
-        .unwrap_or_default();
-    let mut updated_checkpoints = existing_checkpoints.clone();
-    let mut checkpoint_changed = false;
+/// One worker pass over every policy. Sources are planned policy by policy; their buckets are
+/// staged together, so every source in a batch is covered by one persisted pending
+/// materialization before any of its buckets is written, and written afterwards.
+struct RollupPass<'p, 'c> {
+    store: RollupStateStoreContext<'c>,
+    source_reads: RollupSourceReadContext<'c>,
+    materialized_writes: RollupMaterializedWriteContext<'c>,
+    policies: &'p [RollupPolicy],
+    runs: Vec<PolicyRun>,
+    staged: Vec<PlannedRollupSource>,
+    staged_points: usize,
+    first_error: Option<TsinkError>,
+}
 
-    for source in &sources {
-        let checkpoint = existing_checkpoints
-            .get(&source.source_key)
-            .copied()
-            .unwrap_or(i64::MIN);
-        let target_end = existing_pending
-            .get(&source.source_key)
-            .filter(|pending| pending.generation == generation)
-            .map(|pending| pending.materialized_through.max(stable_end))
-            .unwrap_or(stable_end);
-        if checkpoint >= target_end {
-            continue;
+impl<'p, 'c> RollupPass<'p, 'c> {
+    fn new(
+        store: RollupStateStoreContext<'c>,
+        source_reads: RollupSourceReadContext<'c>,
+        materialized_writes: RollupMaterializedWriteContext<'c>,
+        policies: &'p [RollupPolicy],
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            store,
+            source_reads,
+            materialized_writes,
+            policies,
+            runs: policies
+                .iter()
+                .map(|_| PolicyRun {
+                    started: now,
+                    started_at_ms: 0,
+                    finished: now,
+                    report: PolicyRunReport::default(),
+                    source_keys: Vec::new(),
+                    error: None,
+                })
+                .collect(),
+            staged: Vec::new(),
+            staged_points: 0,
+            first_error: None,
         }
+    }
 
-        let plan = source_reads.query_tier_plan(checkpoint, target_end);
-        let raw_points = source_reads.collect_points_for_series_with_plan(
-            source.series_id,
-            checkpoint,
-            target_end,
-            plan,
-        )?;
-        let rollup_points = downsample_points_with_origin(
-            &raw_points,
-            policy.interval,
-            policy.aggregation,
-            policy.bucket_origin,
-            checkpoint,
-            target_end,
-        )?;
+    fn fail(&mut self, policy: usize, err: TsinkError) {
+        let run = &mut self.runs[policy];
+        if run.error.is_none() {
+            run.error = Some(err.to_string());
+        }
+        if self.first_error.is_none() {
+            self.first_error = Some(err);
+        }
+    }
 
-        if !rollup_points.is_empty() {
-            store.stage_pending_rollup_materialization(
-                &policy.id,
-                &source.source_key,
-                PendingRollupMaterialization {
+    fn run_policy(&mut self, policy: usize, max_observed: i64) {
+        self.runs[policy].started = Instant::now();
+        self.runs[policy].started_at_ms = now_unix_ms();
+        if let Err(err) = self.plan_policy(policy, max_observed) {
+            self.fail(policy, err);
+        }
+        self.runs[policy].finished = Instant::now();
+    }
+
+    fn plan_policy(&mut self, index: usize, max_observed: i64) -> Result<()> {
+        let policies = self.policies;
+        let policy = &policies[index];
+        let sources = self.source_reads.matching_rollup_sources(policy)?;
+        self.runs[index].report.matched_series = u64::try_from(sources.len()).unwrap_or(u64::MAX);
+        self.runs[index].source_keys = sources
+            .iter()
+            .map(|source| source.source_key.clone())
+            .collect();
+
+        let Some(stable_end) = aligned_materialized_end(policy, max_observed) else {
+            return Ok(());
+        };
+
+        let generation = self.store.policy_generation(&policy.id);
+        let rollup_metric = rollup_metric_name(policy, generation);
+        let existing_checkpoints = self
+            .store
+            .state
+            .checkpoints
+            .read()
+            .get(&policy.id)
+            .cloned()
+            .unwrap_or_default();
+        let existing_pending = self
+            .store
+            .state
+            .pending_materializations
+            .read()
+            .get(&policy.id)
+            .cloned()
+            .unwrap_or_default();
+
+        for source in sources {
+            if self.runs[index].error.is_some() {
+                break;
+            }
+            let checkpoint = existing_checkpoints
+                .get(&source.source_key)
+                .copied()
+                .unwrap_or(i64::MIN);
+            let target_end = existing_pending
+                .get(&source.source_key)
+                .filter(|pending| pending.generation == generation)
+                .map(|pending| pending.materialized_through.max(stable_end))
+                .unwrap_or(stable_end);
+            if checkpoint >= target_end {
+                continue;
+            }
+
+            let plan = self.source_reads.query_tier_plan(checkpoint, target_end);
+            let raw_points = self.source_reads.collect_points_for_series_with_plan(
+                source.series_id,
+                checkpoint,
+                target_end,
+                plan,
+            )?;
+            let rollup_points = downsample_points_with_origin(
+                &raw_points,
+                policy.interval,
+                policy.aggregation,
+                policy.bucket_origin,
+                checkpoint,
+                target_end,
+            )?;
+
+            if rollup_points.is_empty() {
+                self.store.mark_rollup_checkpoint_in_memory(
+                    &policy.id,
+                    &source.source_key,
+                    target_end,
+                );
+                self.store
+                    .clear_pending_rollup_materialization_in_memory(&policy.id, &source.source_key);
+                self.runs[index].report.checkpoint_changed = true;
+                continue;
+            }
+
+            self.staged_points = self.staged_points.saturating_add(rollup_points.len());
+            self.staged.push(PlannedRollupSource {
+                policy: index,
+                source,
+                rollup_metric: rollup_metric.clone(),
+                pending: PendingRollupMaterialization {
                     checkpoint,
                     materialized_through: target_end,
                     generation,
                 },
-            )?;
-
-            let existing_rollup_series_id = source_reads
-                .registry
-                .resolve_existing_series_id(rollup_metric.as_str(), &source.labels);
-            let existing_rollup_points = existing_rollup_series_id
-                .map(|series_id| {
-                    source_reads.collect_points_for_series_with_plan(
-                        series_id,
-                        checkpoint,
-                        target_end,
-                        source_reads.query_tier_plan(checkpoint, target_end),
-                    )
-                })
-                .transpose()?
-                .unwrap_or_default();
-            let existing_bucket_timestamps = existing_rollup_points
-                .into_iter()
-                .map(|point| point.timestamp)
-                .collect::<BTreeSet<_>>();
-
-            let rows = rollup_points
-                .into_iter()
-                .filter(|point| !existing_bucket_timestamps.contains(&point.timestamp))
-                .map(|point| Row::with_labels(rollup_metric.clone(), source.labels.clone(), point))
-                .collect::<Vec<_>>();
-
-            if !rows.is_empty() {
-                report.buckets_materialized = report
-                    .buckets_materialized
-                    .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
-                report.points_materialized = report
-                    .points_materialized
-                    .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
-                let _ = materialized_writes.insert_rows(&rows)?;
+                points: rollup_points,
+            });
+            if self.staged_points >= ROLLUP_STAGING_BATCH_POINTS {
+                self.write_staged();
             }
         }
-
-        updated_checkpoints.insert(source.source_key.clone(), target_end);
-        store.mark_rollup_checkpoint_in_memory(&policy.id, &source.source_key, target_end);
-        store.clear_pending_rollup_materialization_in_memory(&policy.id, &source.source_key);
-        checkpoint_changed = true;
+        Ok(())
     }
 
-    if checkpoint_changed {
-        store
-            .state
-            .checkpoints
-            .write()
-            .insert(policy.id.clone(), updated_checkpoints.clone());
-        report.checkpoint_changed = true;
-    }
+    fn write_staged(&mut self) {
+        let staged = std::mem::take(&mut self.staged);
+        self.staged_points = 0;
+        if staged.is_empty() {
+            return;
+        }
 
-    let mut min_through = None::<i64>;
-    let mut materialized_series = 0u64;
-    for source in &sources {
-        if let Some(materialized_through) = updated_checkpoints.get(&source.source_key).copied() {
-            materialized_series = materialized_series.saturating_add(1);
-            min_through = Some(
-                min_through
-                    .map(|current| current.min(materialized_through))
-                    .unwrap_or(materialized_through),
-            );
+        let policies = self.policies;
+        let staging = self
+            .store
+            .stage_pending_rollup_materializations(staged.iter().map(|item| {
+                (
+                    policies[item.policy].id.as_str(),
+                    item.source.source_key.as_str(),
+                    item.pending.clone(),
+                )
+            }));
+        if let Err(err) = staging {
+            let message = err.to_string();
+            for item in &staged {
+                let run = &mut self.runs[item.policy];
+                if run.error.is_none() {
+                    run.error = Some(message.clone());
+                }
+                run.finished = Instant::now();
+            }
+            if self.first_error.is_none() {
+                self.first_error = Some(err);
+            }
+            return;
+        }
+
+        for item in staged {
+            if self.runs[item.policy].error.is_some() {
+                continue;
+            }
+            let policy_id = policies[item.policy].id.as_str();
+            match self.write_planned(&item) {
+                Ok(written) => {
+                    let report = &mut self.runs[item.policy].report;
+                    report.buckets_materialized =
+                        report.buckets_materialized.saturating_add(written);
+                    report.points_materialized = report.points_materialized.saturating_add(written);
+                    report.checkpoint_changed = true;
+                    self.store.mark_rollup_checkpoint_in_memory(
+                        policy_id,
+                        &item.source.source_key,
+                        item.pending.materialized_through,
+                    );
+                    self.store.clear_pending_rollup_materialization_in_memory(
+                        policy_id,
+                        &item.source.source_key,
+                    );
+                }
+                Err(err) => self.fail(item.policy, err),
+            }
+            self.runs[item.policy].finished = Instant::now();
         }
     }
-    report.materialized_series = materialized_series;
-    report.materialized_through = min_through;
-    Ok(report)
+
+    fn write_planned(&self, item: &PlannedRollupSource) -> Result<u64> {
+        let checkpoint = item.pending.checkpoint;
+        let target_end = item.pending.materialized_through;
+        let existing_rollup_series_id = self
+            .source_reads
+            .registry
+            .resolve_existing_series_id(item.rollup_metric.as_str(), &item.source.labels);
+        let existing_bucket_timestamps = existing_rollup_series_id
+            .map(|series_id| {
+                self.source_reads.collect_points_for_series_with_plan(
+                    series_id,
+                    checkpoint,
+                    target_end,
+                    self.source_reads.query_tier_plan(checkpoint, target_end),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|point| point.timestamp)
+            .collect::<BTreeSet<_>>();
+
+        let rows = item
+            .points
+            .iter()
+            .filter(|point| !existing_bucket_timestamps.contains(&point.timestamp))
+            .map(|point| {
+                Row::with_labels(
+                    item.rollup_metric.clone(),
+                    item.source.labels.clone(),
+                    point.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            let _ = self.materialized_writes.insert_rows(&rows)?;
+        }
+        Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+    }
+
+    /// Records every policy's run state and returns whether any checkpoint moved.
+    fn finish(self, observability: &RollupObservabilityCounters) -> (bool, Option<TsinkError>) {
+        let checkpoints = self.store.checkpoints_snapshot();
+        let mut checkpoints_dirty = false;
+        for (policy, run) in self.policies.iter().zip(self.runs) {
+            checkpoints_dirty |= run.report.checkpoint_changed;
+            observability
+                .buckets_materialized_total
+                .fetch_add(run.report.buckets_materialized, Ordering::Relaxed);
+            observability
+                .points_materialized_total
+                .fetch_add(run.report.points_materialized, Ordering::Relaxed);
+
+            let mut report = run.report;
+            let policy_checkpoints = checkpoints.get(&policy.id);
+            let mut min_through = None::<i64>;
+            let mut materialized_series = 0u64;
+            for source_key in &run.source_keys {
+                if let Some(materialized_through) = policy_checkpoints
+                    .and_then(|entries| entries.get(source_key))
+                    .copied()
+                {
+                    materialized_series = materialized_series.saturating_add(1);
+                    min_through = Some(
+                        min_through
+                            .map(|current| current.min(materialized_through))
+                            .unwrap_or(materialized_through),
+                    );
+                }
+            }
+            report.materialized_series = materialized_series;
+            report.materialized_through = min_through;
+
+            let duration_nanos = u64::try_from(run.finished.duration_since(run.started).as_nanos())
+                .unwrap_or(u64::MAX);
+            let completed_at_ms = run.started_at_ms.saturating_add(duration_nanos / 1_000_000);
+            match run.error {
+                None => self.store.set_rollup_policy_run_state(
+                    &policy.id,
+                    &report,
+                    run.started_at_ms,
+                    completed_at_ms,
+                    duration_nanos,
+                    None,
+                ),
+                Some(error) => self.store.set_rollup_policy_run_state(
+                    &policy.id,
+                    &PolicyRunReport::default(),
+                    run.started_at_ms,
+                    completed_at_ms,
+                    duration_nanos,
+                    Some(error),
+                ),
+            }
+        }
+        (checkpoints_dirty, self.first_error)
+    }
 }
 
 // Caller must hold `rollup_run_lock`. This keeps policy-set replacement, persistence,
@@ -389,57 +587,18 @@ fn run_rollup_pipeline_once_locked_impl(
     let max_observed = source_reads
         .bounded_recency_reference_timestamp()
         .unwrap_or(i64::MIN);
-    let mut checkpoints_dirty = false;
-    let mut first_error: Option<TsinkError> = None;
 
-    for policy in policies {
-        let policy_started_at_ms = now_unix_ms();
-        let policy_started = Instant::now();
+    let mut pass = RollupPass::new(store, source_reads, materialized_writes, &policies);
+    for (index, _policy) in policies.iter().enumerate() {
         observability
             .policy_runs_total
             .fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
-        store.invoke_policy_start_hook(&policy);
-
-        match run_rollup_policy_once(
-            store,
-            source_reads,
-            materialized_writes,
-            &policy,
-            max_observed,
-        ) {
-            Ok(report) => {
-                checkpoints_dirty |= report.checkpoint_changed;
-                observability
-                    .buckets_materialized_total
-                    .fetch_add(report.buckets_materialized, Ordering::Relaxed);
-                observability
-                    .points_materialized_total
-                    .fetch_add(report.points_materialized, Ordering::Relaxed);
-                store.set_rollup_policy_run_state(
-                    &policy.id,
-                    &report,
-                    policy_started_at_ms,
-                    now_unix_ms(),
-                    elapsed_nanos_u64(policy_started),
-                    None,
-                );
-            }
-            Err(err) => {
-                store.set_rollup_policy_run_state(
-                    &policy.id,
-                    &PolicyRunReport::default(),
-                    policy_started_at_ms,
-                    now_unix_ms(),
-                    elapsed_nanos_u64(policy_started),
-                    Some(err.to_string()),
-                );
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-        }
+        store.invoke_policy_start_hook(_policy);
+        pass.run_policy(index, max_observed);
     }
+    pass.write_staged();
+    let (checkpoints_dirty, first_error) = pass.finish(observability);
 
     if checkpoints_dirty {
         let checkpoints = store.checkpoints_snapshot();
