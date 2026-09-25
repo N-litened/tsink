@@ -485,6 +485,57 @@ fn compaction_fails_when_any_source_segment_is_corrupted() {
 }
 
 #[test]
+fn compaction_keeps_its_marker_until_source_removals_are_durable() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    for (segment_id, points) in [(1, [(10, 1.0), (20, 2.0)]), (2, [(15, 3.0), (30, 4.0)])] {
+        let chunks = HashMap::from([(series_id, vec![make_numeric_chunk(series_id, &points)])]);
+        SegmentWriter::new(temp_dir.path(), 0, segment_id)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
+    let markers = || {
+        std::fs::read_dir(temp_dir.path().join(super::COMPACTION_REPLACEMENT_DIR))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    };
+
+    {
+        let level_root = temp_dir.path().join("segments").join("L0");
+        let _guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+            move |path| path == level_root,
+            "injected source level sync failure",
+        );
+        let err = Compactor::new(temp_dir.path(), 8)
+            .compact_once()
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected source level sync failure"));
+    }
+    assert_eq!(
+        markers(),
+        1,
+        "the marker must stay until the source removals are durable"
+    );
+
+    finalize_pending_compaction_replacements(temp_dir.path()).unwrap();
+    assert!(load_segments_for_level(temp_dir.path(), 0)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
+        1
+    );
+    assert_eq!(markers(), 0);
+}
+
+#[test]
 fn finalize_pending_replacements_removes_marked_source_segments() {
     let temp_dir = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();

@@ -118,11 +118,20 @@ fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> 
         }
     }
 
+    let mut source_parents = std::collections::BTreeSet::new();
     for source in &source_segments {
-        remove_dir_if_exists(source).map_err(|err| TsinkError::IoWithPath {
+        let removed = remove_dir_if_exists(source).map_err(|err| TsinkError::IoWithPath {
             path: source.clone(),
             source: err,
         })?;
+        if let (true, Some(parent)) = (removed, source.parent()) {
+            source_parents.insert(parent.to_path_buf());
+        }
+    }
+    // Startup finishes this replacement only while the marker exists, so the source
+    // removals must be durable before the marker's removal can be.
+    for parent in &source_parents {
+        crate::engine::fs_utils::sync_dir(parent)?;
     }
 
     match fs::remove_file(marker_path) {
