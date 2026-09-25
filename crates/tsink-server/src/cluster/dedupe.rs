@@ -267,12 +267,18 @@ impl DedupeWindowStore {
             CLUSTER_DEDUPE_EVICTED_KEYS_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
 
-        if let Err(err) = append_record_locked(&mut state, key, expires_at) {
-            CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
-            eprintln!("cluster dedupe append failed: {err}");
+        // The write is already applied, so a failed append keeps the key deduplicated in
+        // memory rather than failing the request (a retry would then insert again). Only
+        // the restart-surviving part is lost; it is counted apart from durable commits.
+        match append_record_locked(&mut state, key, expires_at) {
+            Ok(()) => {
+                CLUSTER_DEDUPE_COMMITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(err) => {
+                CLUSTER_DEDUPE_PERSISTENCE_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
+                eprintln!("cluster dedupe append failed: {err}");
+            }
         }
-
-        CLUSTER_DEDUPE_COMMITS_TOTAL.fetch_add(1, Ordering::Relaxed);
         self.maybe_cleanup_locked(&mut state, now, false);
         update_gauges(&state);
     }

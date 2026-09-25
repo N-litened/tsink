@@ -1298,6 +1298,14 @@ pub(super) async fn handle_internal_ingest_write(
         }
     }
 
+    // A failed write releases its idempotency key so the sender's retry is not refused as
+    // still in flight.
+    let abort_dedupe = || {
+        if let (Some(store), Some(key)) = (dedupe_store, dedupe_key_to_commit.as_deref()) {
+            store.abort(key);
+        }
+    };
+
     if !payload.rows.is_empty() {
         let storage = Arc::clone(storage);
         let rows = payload
@@ -1310,6 +1318,7 @@ pub(super) async fn handle_internal_ingest_write(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
+                abort_dedupe();
                 return internal_storage_write_error_response(
                     &err,
                     500,
@@ -1319,6 +1328,7 @@ pub(super) async fn handle_internal_ingest_write(
                 );
             }
             Err(err) => {
+                abort_dedupe();
                 return internal_error_response(
                     500,
                     "storage_insert_task_failed",
@@ -1337,6 +1347,7 @@ pub(super) async fn handle_internal_ingest_write(
         {
             Ok(applied) => applied,
             Err(err) => {
+                abort_dedupe();
                 return internal_error_response(
                     500,
                     "metadata_store_failed",
@@ -1356,6 +1367,7 @@ pub(super) async fn handle_internal_ingest_write(
     ) {
         Ok(outcome) => outcome,
         Err(err) => {
+            abort_dedupe();
             return internal_error_response(
                 500,
                 "exemplar_store_failed",

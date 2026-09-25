@@ -10437,6 +10437,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_internal_ingest_write_releases_its_idempotency_key() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let internal_api = internal_api();
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_dedupe(&temp_dir);
+
+        // The storage is closed, so each attempt fails after the key was taken.
+        storage.close().expect("storage should close");
+        let payload = InternalIngestWriteRequest {
+            ring_version: DEFAULT_INTERNAL_RING_VERSION,
+            idempotency_key: Some("tsink:test:failed-write:1".to_string()),
+            tenant_id: None,
+            required_capabilities: Vec::new(),
+            rows: vec![InternalRow {
+                metric: "internal_metric".to_string(),
+                labels: vec![Label::new("node", "a")],
+                data_point: DataPoint::new(1_700_000_000_100, 42.0),
+            }],
+            metadata_updates: Vec::new(),
+            exemplars: Vec::new(),
+        };
+        let encoded = serde_json::to_vec(&payload).expect("payload should encode");
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let response = handle_request_with_admin_and_cluster(
+                &storage,
+                &engine,
+                HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/internal/v1/ingest_write".to_string(),
+                    headers: internal_headers(
+                        Some(&internal_api.auth_token),
+                        Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                        &[("content-type", "application/json")],
+                    ),
+                    body: encoded.clone(),
+                },
+                start_time(),
+                TimestampPrecision::Milliseconds,
+                false,
+                None,
+                Some(&internal_api),
+                Some(cluster_context.as_ref()),
+            )
+            .await;
+            statuses.push(response.status);
+        }
+        assert_ne!(statuses[0], 200);
+        assert_eq!(
+            statuses[1], statuses[0],
+            "the retry must not be refused as in flight"
+        );
+    }
+
+    #[tokio::test]
     async fn internal_ingest_deduplicates_replayed_idempotency_key() {
         let storage = make_storage();
         let engine = make_engine(&storage);
