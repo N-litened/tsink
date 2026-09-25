@@ -172,7 +172,9 @@ Keys expire after `TSINK_CLUSTER_DEDUPE_WINDOW_SECS` (default 15 minutes). The l
 
 ## Control plane consensus
 
-The cluster control plane (membership, shard ring, handoff state) is managed by `ControlConsensusRuntime`, which implements a Raft-like replicated log. Every mutation to the control state goes through a `propose` call that replicates the log entry to all peers and waits until a quorum has persisted it.
+The cluster control plane (membership, shard ring, handoff state) is managed by `ControlConsensusRuntime`, which implements a Raft-like replicated log. Every mutation to the control state goes through a `propose` call that replicates the log entry to all peers and waits until a quorum of Active nodes has persisted it.
+
+**Limitation:** leadership is not decided by Raft elections. When the leader's lease expires, the next Active node in a fixed order takes over by proposing itself, without a vote or a check that its log is up to date, and each proposal starts a new term. During a network partition an old leader and its successor can therefore both commit different control commands at the same log index, leaving nodes with diverging membership or ring state. Avoid membership and rebalance changes while nodes cannot reach each other, and afterwards compare `data.cluster.control` (leader, term, commit index) from `GET /api/v1/status/tsdb` on each node.
 
 The control state tracks:
 - The `ShardRingSnapshot` (current shard assignments).
