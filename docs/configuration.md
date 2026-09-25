@@ -49,8 +49,8 @@ These are the options exposed through the `StorageBuilder` Rust API and the equi
 | Builder method | Type | Default | Description |
 |---|---|---|---|
 | `with_retention(duration)` | `Duration` | `14 days` | How long data is retained. Writes outside this window are rejected when `retention_enforced` is set (which `with_retention` enables automatically). |
-| `with_hot_tier_retention(duration)` | `Duration` | *(falls back to `retention`)* | Age at which data moves from local (hot) to object-store warm tier. |
-| `with_warm_tier_retention(duration)` | `Duration` | *(falls back to `retention`)* | Age at which data moves from warm to cold tier. |
+| `with_hot_tier_retention(duration)` | `Duration` | *(falls back to `retention`)* | Age at which data moves from local (hot) to object-store warm tier. Must be shorter than `retention` for data to move. |
+| `with_warm_tier_retention(duration)` | `Duration` | *(falls back to `retention`)* | Age at which data moves from warm to cold tier. Must be shorter than `retention` for data to move. |
 | `with_mirror_hot_segments_to_object_store(bool)` | `bool` | `false` | Copy freshly-persisted hot segments into `<object_store_path>/hot/` in addition to writing locally. Useful for cross-node availability. |
 | `with_remote_segment_cache_policy(policy)` | `RemoteSegmentCachePolicy` | `MetadataOnly` | What to hold in memory for remote (object-store) segments: `MetadataOnly` or `Full`. |
 | `with_remote_segment_refresh_interval(duration)` | `Duration` | `5s` | How often a `ComputeOnly` node refreshes its view of remote segment metadata. |
@@ -127,8 +127,8 @@ tsink-server --help
 | `--object-store-path <PATH>` | *(none)* | Object-store root for tiered segment lanes (`hot/`, `warm/`, `cold/`). |
 | `--timestamp-precision <PRECISION>` | `ms` | Units for raw timestamps: `s`, `ms`, `us`, `ns`. |
 | `--retention <DURATION>` | `14d` | Data retention window (e.g. `7d`, `24h`, `90d`). |
-| `--hot-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which local segments move to the warm object-store tier. |
-| `--warm-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which warm segments move to the cold object-store tier. |
+| `--hot-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which local segments move to the warm object-store tier. Must be shorter than `--retention` for segments to move. |
+| `--warm-tier-retention <DURATION>` | *(same as `--retention`)* | Age at which warm segments move to the cold object-store tier. Must be shorter than `--retention` for segments to move. |
 | `--storage-mode <MODE>` | `read-write` | `read-write` — normal full node. `compute-only` — query-only node backed by object store. |
 | `--remote-segment-refresh-interval <DURATION>` | `5s` | Metadata refresh interval for `compute-only` nodes. |
 | `--mirror-hot-segments-to-object-store` | `false` | Copy hot segments to object store as they are sealed. |

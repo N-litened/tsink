@@ -6,15 +6,17 @@ tsink supports automatic hot → warm → cold tiered storage backed by an objec
 
 ## Overview
 
-Without tiered storage, all persisted segments live on the local data volume. Tiered storage extends that with a second volume — the **object-store root** — that holds three subdirectories:
+Without tiered storage, all persisted segments live on the local data volume. Tiered storage extends that with a second volume — the **object-store root** — for the warm and cold tiers:
 
 | Tier | Location | Data age |
 |------|----------|----------|
-| **Hot** | `{object_store_root}/hot/` | Within `hot_retention_window` of the ingestion frontier |
+| **Hot** | `data_path` (`{object_store_root}/hot/` only when there is no local data path; hot mirroring also copies segments there) | Within `hot_retention_window` of the ingestion frontier |
 | **Warm** | `{object_store_root}/warm/` | Older than `hot_retention_window`, within `warm_retention_window` |
 | **Cold** | `{object_store_root}/cold/` | Older than `warm_retention_window`, within the global retention window |
 
 Segments past the global retention window are deleted.
+
+Segments only move when the tier windows are shorter than the global retention. An omitted hot or warm window falls back to the global retention, so with an object-store path and neither window set, segments stay in the hot tier until they are deleted (the server logs a warning at startup in that case).
 
 Tiering is **optional** and **disabled by default**. When disabled, all segments remain in the local `data_path` and no warm/cold movement ever occurs.
 
@@ -62,7 +64,7 @@ tsink-server \
 
 | Method | Default | Description |
 |--------|---------|-------------|
-| `with_object_store_path(path)` | `None` (no tiering) | Sets the root path for warm/cold segment storage. Typically a path on an object-store-backed volume separate from `data_path`. Setting this enables tiering. |
+| `with_object_store_path(path)` | `None` (no tiering) | Sets the root path for warm/cold segment storage. Typically a path on an object-store-backed volume separate from `data_path`. Setting this enables tiering; set tier windows shorter than the retention for segments to move. |
 | `with_tiered_retention_policy(hot, warm)` | — | Sets hot and warm cutoff windows and enables retention enforcement. |
 | `with_retention(duration)` | 14 days | Global data expiry. Also used as the fallback value for unconfigured tier windows. |
 | `with_runtime_mode(mode)` | `ReadWrite` | `ComputeOnly` for query-only nodes — see [Compute-only mode](#compute-only-mode). |
@@ -75,8 +77,8 @@ tsink-server \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--object-store-path PATH` | unset | Object-store root — enables tiering |
-| `--hot-tier-retention DURATION` | falls back to `--retention` | Age cutoff for hot→warm migration |
-| `--warm-tier-retention DURATION` | falls back to `--retention` | Age cutoff for warm→cold migration |
+| `--hot-tier-retention DURATION` | falls back to `--retention` (no movement) | Age cutoff for hot→warm migration |
+| `--warm-tier-retention DURATION` | falls back to `--retention` (no movement) | Age cutoff for warm→cold migration |
 | `--retention DURATION` | `14d` | Global expiry |
 | `--storage-mode MODE` | `read-write` | `read-write` or `compute-only` |
 | `--remote-segment-refresh-interval DURATION` | ~5 s | Catalog refresh TTL |

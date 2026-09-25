@@ -1465,6 +1465,16 @@ fn build_storage(config: &ServerConfig) -> tsink::Result<Arc<dyn Storage>> {
 
     if let Some(path) = &config.object_store_path {
         builder = builder.with_object_store_path(path);
+        if config.storage_mode == StorageRuntimeMode::ReadWrite
+            && config.hot_tier_retention.is_none()
+            && config.warm_tier_retention.is_none()
+        {
+            eprintln!(
+                "warning: --object-store-path is set without --hot-tier-retention or \
+                 --warm-tier-retention; both default to --retention, so segments stay in the \
+                 hot tier until they expire and nothing moves to the object store"
+            );
+        }
     }
     if let Some(retention) = config.hot_tier_retention.zip(config.warm_tier_retention) {
         builder = builder.with_tiered_retention_policy(retention.0, retention.1);
