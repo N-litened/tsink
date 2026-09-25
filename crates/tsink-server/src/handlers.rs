@@ -6582,11 +6582,12 @@ fn promql_histogram_json(histogram: &tsink::NativeHistogram) -> JsonValue {
     })
 }
 
+// Prometheus' boundary rules: 0 = (a, b], 1 = [a, b), 2 = (a, b), 3 = [a, b].
 fn histogram_bucket_boundary_code(lower_inclusive: bool, upper_inclusive: bool) -> i32 {
     match (lower_inclusive, upper_inclusive) {
-        (false, false) => 0,
-        (false, true) => 1,
-        (true, false) => 2,
+        (false, true) => 0,
+        (true, false) => 1,
+        (false, false) => 2,
         (true, true) => 3,
     }
 }
