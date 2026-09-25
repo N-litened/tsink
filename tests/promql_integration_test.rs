@@ -2114,3 +2114,58 @@ fn label_replace_anchors_the_regex_and_range_functions_drop_the_metric_name() {
     );
     assert_eq!(last[0].metric, "http_requests_total");
 }
+
+#[test]
+fn metric_name_behaves_as_the_name_label() {
+    let storage = setup_group_matching_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let by_name = as_instant_vector(
+        engine
+            .instant_query(
+                r#"sum by (__name__) ({__name__=~"left_metric|right_metric"})"#,
+                60,
+            )
+            .unwrap(),
+    );
+    let mut names = by_name
+        .iter()
+        .map(|sample| (sample.metric.as_str(), sample.value))
+        .collect::<Vec<_>>();
+    names.sort_by(|a, b| a.0.cmp(b.0));
+    assert_eq!(names, vec![("left_metric", 15.0), ("right_metric", 2.0)]);
+
+    let on_name = as_instant_vector(
+        engine
+            .instant_query(r#"left_metric + on(__name__, job) right_metric"#, 60)
+            .unwrap(),
+    );
+    assert!(on_name.is_empty());
+
+    let replaced = as_instant_vector(
+        engine
+            .instant_query(
+                r#"label_replace(right_metric, "copy", "$1", "__name__", "(.*)_metric")"#,
+                60,
+            )
+            .unwrap(),
+    );
+    assert!(replaced[0]
+        .labels
+        .iter()
+        .any(|label| label.name == "copy" && label.value == "right"));
+
+    let renamed = as_instant_vector(
+        engine
+            .instant_query(
+                r#"label_replace(right_metric, "__name__", "renamed", "team", ".*")"#,
+                60,
+            )
+            .unwrap(),
+    );
+    assert_eq!(renamed[0].metric, "renamed");
+    assert!(renamed[0]
+        .labels
+        .iter()
+        .all(|label| label.name != "__name__"));
+}

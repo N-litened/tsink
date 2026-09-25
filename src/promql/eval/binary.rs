@@ -362,7 +362,12 @@ fn sample_key(sample: &Sample, matching: Option<&VectorMatching>) -> Vec<u8> {
                 .filter(|l| wanted.contains(l.name.as_str()))
                 .cloned()
                 .collect::<Vec<_>>();
-            canonical_series_identity("", &selected)
+            let metric = if wanted.contains("__name__") {
+                sample.metric.as_str()
+            } else {
+                ""
+            };
+            canonical_series_identity(metric, &selected)
         }
         Some(m) => {
             let ignored: BTreeSet<&str> = m.labels.iter().map(|s| s.as_str()).collect();

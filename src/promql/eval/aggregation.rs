@@ -25,11 +25,15 @@ pub(crate) fn eval_aggregation(
         return Ok(PromqlValue::InstantVector(Vec::new()));
     }
 
-    let mut groups: BTreeMap<Vec<u8>, (Vec<Label>, Vec<Sample>)> = BTreeMap::new();
+    // Group identity -> ((metric, labels), samples).
+    type Groups = BTreeMap<Vec<u8>, ((String, Vec<Label>), Vec<Sample>)>;
+    let mut groups = Groups::new();
     for sample in samples {
-        let labels = grouped_labels(&sample.labels, expr.grouping.as_ref());
-        let key = labels_identity(&labels);
-        let entry = groups.entry(key).or_insert_with(|| (labels, Vec::new()));
+        let (metric, labels) = grouped_labels(&sample, expr.grouping.as_ref());
+        let key = canonical_series_identity(&metric, &labels);
+        let entry = groups
+            .entry(key)
+            .or_insert_with(|| ((metric, labels), Vec::new()));
         entry.1.push(sample);
     }
 
@@ -43,24 +47,21 @@ pub(crate) fn eval_aggregation(
         | AggregationOp::Group
         | AggregationOp::Stddev
         | AggregationOp::Stdvar => {
-            for (_, (labels, group_samples)) in groups {
+            for (_, ((metric, labels), group_samples)) in groups {
                 let timestamp = max_timestamp(&group_samples, params.eval_time);
                 match aggregate_group(expr.op, &group_samples)? {
                     AggregationValue::Float(value) => {
-                        out.push(Sample::from_float(String::new(), labels, timestamp, value))
+                        out.push(Sample::from_float(metric, labels, timestamp, value))
                     }
                     AggregationValue::Histogram(histogram) => out.push(Sample::from_histogram(
-                        String::new(),
-                        labels,
-                        timestamp,
-                        *histogram,
+                        metric, labels, timestamp, *histogram,
                     )),
                 }
             }
         }
         AggregationOp::Quantile => {
             let phi = aggregation_quantile(engine, expr, params)?;
-            for (_, (labels, group_samples)) in groups {
+            for (_, ((metric, labels), group_samples)) in groups {
                 if group_samples
                     .iter()
                     .any(|sample| sample.histogram.is_some())
@@ -70,7 +71,7 @@ pub(crate) fn eval_aggregation(
                 let timestamp = max_timestamp(&group_samples, params.eval_time);
                 let value = quantile_of_samples(&group_samples, phi);
                 out.push(Sample {
-                    metric: String::new(),
+                    metric,
                     labels,
                     timestamp,
                     value,
@@ -80,7 +81,7 @@ pub(crate) fn eval_aggregation(
         }
         AggregationOp::CountValues => {
             let label_name = aggregation_label_name(engine, expr, params)?;
-            for (_, (labels, group_samples)) in groups {
+            for (_, ((metric, labels), group_samples)) in groups {
                 if group_samples
                     .iter()
                     .any(|sample| sample.histogram.is_some())
@@ -99,7 +100,7 @@ pub(crate) fn eval_aggregation(
                     let mut labels = labels.clone();
                     set_label(&mut labels, &label_name, &value_label);
                     out.push(Sample {
-                        metric: String::new(),
+                        metric: metric.clone(),
                         labels,
                         timestamp,
                         value: count as f64,
@@ -445,7 +446,17 @@ fn quantile(values: &mut [f64], phi: f64) -> f64 {
     values[lower] + (values[upper] - values[lower]) * weight
 }
 
-fn grouped_labels(labels: &[Label], grouping: Option<&Grouping>) -> Vec<Label> {
+/// Returns the metric name and labels that identify the sample's group.
+/// Like Prometheus, `by (__name__)` keeps the metric name and `without` always
+/// drops it.
+fn grouped_labels(sample: &Sample, grouping: Option<&Grouping>) -> (String, Vec<Label>) {
+    let labels = &sample.labels;
+    let metric = match grouping {
+        Some(grouping) if !grouping.without && grouping.labels.iter().any(|l| l == "__name__") => {
+            sample.metric.clone()
+        }
+        _ => String::new(),
+    };
     let mut out = match grouping {
         None => Vec::new(),
         Some(grouping) if grouping.without => {
@@ -469,11 +480,7 @@ fn grouped_labels(labels: &[Label], grouping: Option<&Grouping>) -> Vec<Label> {
     };
 
     out.sort();
-    out
-}
-
-fn labels_identity(labels: &[Label]) -> Vec<u8> {
-    canonical_series_identity("", labels)
+    (metric, out)
 }
 
 fn sample_value_label(value: f64) -> String {

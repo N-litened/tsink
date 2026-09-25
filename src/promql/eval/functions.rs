@@ -1388,8 +1388,8 @@ fn eval_sort_by_label(
 
     vector.sort_by(|a, b| {
         for label_name in &label_names {
-            let av = label_value_for_sort(a, label_name);
-            let bv = label_value_for_sort(b, label_name);
+            let av = sample_label_value(a, label_name);
+            let bv = sample_label_value(b, label_name);
             let ord = natural_cmp(&av, &bv);
             if !ord.is_eq() {
                 return if desc { ord.reverse() } else { ord };
@@ -1550,17 +1550,11 @@ fn eval_label_replace(
     let mut out = Vec::with_capacity(vector.len());
 
     for mut sample in vector {
-        let src_val = sample
-            .labels
-            .iter()
-            .find(|l| l.name == src)
-            .map(|l| l.value.clone())
-            .unwrap_or_default();
-
+        let src_val = sample_label_value(&sample, &src);
         if let Some(captures) = regex.captures(&src_val) {
             let mut replaced = String::new();
             captures.expand(&replacement, &mut replaced);
-            set_label(&mut sample.labels, &dst, &replaced);
+            set_sample_label(&mut sample, &dst, &replaced);
         }
 
         out.push(sample);
@@ -1594,18 +1588,11 @@ fn eval_label_join(
     for sample in &mut vector {
         let joined = src_labels
             .iter()
-            .map(|name| {
-                sample
-                    .labels
-                    .iter()
-                    .find(|l| l.name == *name)
-                    .map(|l| l.value.clone())
-                    .unwrap_or_default()
-            })
+            .map(|name| sample_label_value(sample, name))
             .collect::<Vec<_>>()
             .join(&sep);
 
-        set_label(&mut sample.labels, &dst, &joined);
+        set_sample_label(sample, &dst, &joined);
     }
 
     Ok(PromqlValue::InstantVector(vector))
@@ -1708,7 +1695,8 @@ fn absent_labels_from_matchers(matchers: &[crate::promql::ast::LabelMatcher]) ->
     labels
 }
 
-fn label_value_for_sort(sample: &Sample, name: &str) -> String {
+/// Returns a label value, treating `__name__` as the metric name.
+fn sample_label_value(sample: &Sample, name: &str) -> String {
     if name == "__name__" {
         return sample.metric.clone();
     }
@@ -1953,6 +1941,15 @@ fn natural_cmp(lhs: &str, rhs: &str) -> std::cmp::Ordering {
     }
 
     left.len().cmp(&right.len())
+}
+
+/// Sets a label, treating `__name__` as the metric name.
+fn set_sample_label(sample: &mut Sample, name: &str, value: &str) {
+    if name == "__name__" {
+        sample.metric = value.to_string();
+    } else {
+        set_label(&mut sample.labels, name, value);
+    }
 }
 
 // An empty value removes the label, as in Prometheus.
