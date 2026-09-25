@@ -985,9 +985,23 @@ fn subquery_returns_range_vectors_and_uses_default_or_explicit_resolution() {
             .unwrap(),
     );
     assert_eq!(defaulted.len(), 1);
-    assert_eq!(defaulted[0].samples.len(), 6);
-    assert_eq!(defaulted[0].samples[0], (300, 300.0));
-    assert_eq!(defaulted[0].samples[5], (600, 600.0));
+    assert_eq!(defaulted[0].samples.len(), 5);
+    assert_eq!(defaulted[0].samples[0], (360, 360.0));
+    assert_eq!(defaulted[0].samples[4], (600, 600.0));
+
+    let unaligned = as_range_vector(
+        engine
+            .instant_query("http_requests_total{method=\"GET\"}[250s:100s]", 600)
+            .unwrap(),
+    );
+    assert_eq!(
+        unaligned[0]
+            .samples
+            .iter()
+            .map(|(ts, _)| *ts)
+            .collect::<Vec<_>>(),
+        vec![400, 500, 600]
+    );
 }
 
 #[test]
@@ -1968,8 +1982,9 @@ fn math_and_predict_linear_functions_work() {
             )
             .unwrap(),
     );
+    // Prometheus returns the smoothed level, which tracks a linear series exactly.
     assert_eq!(des.len(), 1);
-    assert!((des[0].value - 480.0).abs() < 1e-9);
+    assert!((des[0].value - 360.0).abs() < 1e-9);
 
     let holt = as_instant_vector(
         engine
@@ -1977,7 +1992,36 @@ fn math_and_predict_linear_functions_work() {
             .unwrap(),
     );
     assert_eq!(holt.len(), 1);
-    assert!((holt[0].value - 480.0).abs() < 1e-9);
+    assert!((holt[0].value - 360.0).abs() < 1e-9);
+
+    let err = engine
+        .instant_query("holt_winters(gauge_metric[3m], 1, 0.5)", 180)
+        .unwrap_err();
+    assert!(matches!(err, PromqlError::Eval(msg) if msg.contains("(0, 1)")));
+}
+
+#[test]
+fn scalar_math_functions_match_prometheus() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+    let value = |query: &str| {
+        let samples = as_instant_vector(engine.instant_query(query, 600).unwrap());
+        assert_eq!(samples.len(), 1, "{query}");
+        samples[0].value
+    };
+
+    assert_eq!(value("sgn(vector(0))"), 0.0);
+    assert_eq!(value("sgn(vector(-0))"), 0.0);
+    assert_eq!(value("sgn(vector(3))"), 1.0);
+    assert_eq!(value("round(vector(-1.5))"), -1.0);
+    assert_eq!(value("round(vector(-0.5))"), 0.0);
+    assert_eq!(value("round(vector(2.5))"), 3.0);
+    assert!(value("clamp(vector(3), NaN, 5)").is_nan());
+    assert!(value("clamp(vector(NaN), 1, 5)").is_nan());
+    assert!(value("clamp_min(vector(NaN), 5)").is_nan());
+    assert!(value("clamp_min(vector(5), NaN)").is_nan());
+    assert!(value("clamp_max(vector(5), NaN)").is_nan());
+    assert_eq!(value("clamp(vector(7), 1, 5)"), 5.0);
 }
 
 #[test]

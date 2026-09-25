@@ -54,10 +54,12 @@ pub(crate) fn eval_call(
         "count_scalar" => eval_count_scalar(engine, call, params),
         "pi" => eval_pi(engine, call, params),
         "sgn" => eval_unary_map(engine, call, params, |v| {
-            if v.is_nan() {
-                f64::NAN
+            if v > 0.0 {
+                1.0
+            } else if v < 0.0 {
+                -1.0
             } else {
-                v.signum()
+                v
             }
         }),
         "acos" => eval_unary_map(engine, call, params, |v| v.acos()),
@@ -824,9 +826,10 @@ fn eval_double_exponential_smoothing(
     expect_arg_count(call, 3)?;
     let smoothing_factor = expect_scalar(engine.eval(&call.args[1], params)?, &call.func)?;
     let trend_factor = expect_scalar(engine.eval(&call.args[2], params)?, &call.func)?;
-    if !(0.0..=1.0).contains(&smoothing_factor) || !(0.0..=1.0).contains(&trend_factor) {
+    let in_open_unit_interval = |factor: f64| factor > 0.0 && factor < 1.0;
+    if !in_open_unit_interval(smoothing_factor) || !in_open_unit_interval(trend_factor) {
         return Err(PromqlError::Eval(
-            "double_exponential_smoothing parameters must be within [0, 1]".to_string(),
+            "double_exponential_smoothing parameters must be within (0, 1)".to_string(),
         ));
     }
 
@@ -875,7 +878,7 @@ fn double_exponential_smoothing_value(
         trend = trend_factor * (level - previous_level) + (1.0 - trend_factor) * trend;
     }
 
-    Some(level + trend)
+    Some(level)
 }
 
 #[derive(Clone)]
@@ -1219,7 +1222,9 @@ fn eval_round(engine: &Engine, call: &CallExpr, params: &QueryParams<'_>) -> Res
         return map_scalar_or_vector(value, |_| f64::NAN);
     }
 
-    map_scalar_or_vector(value, |v| (v / to_nearest).round() * to_nearest)
+    // Ties round toward +Inf, as in Prometheus.
+    let inverse = 1.0 / to_nearest;
+    map_scalar_or_vector(value, |v| (v * inverse + 0.5).floor() / inverse)
 }
 
 fn eval_clamp(engine: &Engine, call: &CallExpr, params: &QueryParams<'_>) -> Result<PromqlValue> {
@@ -1236,7 +1241,7 @@ fn eval_clamp(engine: &Engine, call: &CallExpr, params: &QueryParams<'_>) -> Res
             ))),
         };
     }
-    map_scalar_or_vector(value, |v| v.clamp(min, max))
+    map_scalar_or_vector(value, |v| nan_max(min, nan_min(max, v)))
 }
 
 fn eval_clamp_min_max(
@@ -1249,9 +1254,27 @@ fn eval_clamp_min_max(
     let value = engine.eval(&call.args[0], params)?;
     let bound = expect_scalar(engine.eval(&call.args[1], params)?, &call.func)?;
     if min_side {
-        map_scalar_or_vector(value, |v| v.max(bound))
+        map_scalar_or_vector(value, |v| nan_max(bound, v))
     } else {
-        map_scalar_or_vector(value, |v| v.min(bound))
+        map_scalar_or_vector(value, |v| nan_min(bound, v))
+    }
+}
+
+// `f64::max`/`min` ignore a NaN operand and `f64::clamp` panics on a NaN bound;
+// Prometheus propagates NaN instead.
+fn nan_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+fn nan_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
     }
 }
 
