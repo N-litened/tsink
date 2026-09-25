@@ -30,10 +30,11 @@ maturin develop --release
 ## Quick start
 
 ```python
-from tsink import TsinkStorageBuilder, DataPoint, Label, Row, Value
+from tsink import TsinkStorageBuilder, DataPoint, Label, Row, TimestampPrecision, Value
 
 builder = TsinkStorageBuilder()
 builder.with_data_path("./tsink-data")
+builder.with_timestamp_precision(TimestampPrecision.MILLISECONDS)  # the library default is nanoseconds
 db = builder.build()
 
 db.insert_rows([

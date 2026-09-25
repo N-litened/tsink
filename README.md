@@ -55,10 +55,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 UniFFI bindings expose the core API as a native Python module:
 
 ```python
-from tsink import TsinkStorageBuilder, DataPoint, Row, Value
+from tsink import TsinkStorageBuilder, DataPoint, Row, TimestampPrecision, Value
 
 builder = TsinkStorageBuilder()
 builder.with_data_path("./tsink-data")
+builder.with_timestamp_precision(TimestampPrecision.MILLISECONDS)  # the library default is nanoseconds
 db = builder.build()
 
 db.insert_rows([
