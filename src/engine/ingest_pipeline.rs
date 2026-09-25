@@ -43,6 +43,15 @@ impl<'a> IngestPipeline<'a> {
         if rows.is_empty() {
             return Ok(WriteResult::durable());
         }
+        // Historical raw writes must serialize with the rollup worker so an invalidation
+        // cannot race a checkpoint advance or a generation switch. The worker writes its
+        // buckets through this path while holding the run lock, so take the run lock before
+        // a write permit; the other order deadlocks once the permits are exhausted.
+        let pending_rollup_rebuilds = self
+            .storage
+            .rollup_policy_ids_needing_rebuild_for_rows(rows);
+        let rollup_guard =
+            (!pending_rollup_rebuilds.is_empty()).then(|| self.storage.rollups.run_lock.lock());
         let write_permit = self
             .storage
             .runtime
@@ -51,15 +60,9 @@ impl<'a> IngestPipeline<'a> {
         // A write may pass the first lifecycle check and then block on permits while close starts.
         // Re-check after acquiring a permit so shutdown cannot race new writes through.
         self.storage.ensure_open()?;
-        let pending_rollup_rebuilds = self
-            .storage
-            .rollup_policy_ids_needing_rebuild_for_rows(rows);
 
         let committed = {
-            // Historical raw writes must serialize with the rollup worker so an invalidation
-            // cannot race a checkpoint advance or a generation switch.
-            let _rollup_guard =
-                (!pending_rollup_rebuilds.is_empty()).then(|| self.storage.rollups.run_lock.lock());
+            let _rollup_guard = rollup_guard;
             let pending_rollup_rebuilds = if _rollup_guard.is_some() {
                 self.storage
                     .rollup_policy_ids_needing_rebuild_for_rows(rows)

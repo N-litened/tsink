@@ -1120,6 +1120,61 @@ fn repeated_rollup_invalidations_survive_restart() {
 }
 
 #[test]
+fn late_raw_write_and_rollup_worker_share_a_single_write_permit() {
+    use std::sync::mpsc;
+    use std::thread;
+
+    let temp_dir = TempDir::new().unwrap();
+    let mut options = base_storage_test_options(TimestampPrecision::Milliseconds, None);
+    options.retention_enforced = false;
+    options.max_writers = 1;
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            Some(temp_dir.path().join(BLOB_LANE_ROOT)),
+            1,
+            options,
+        )
+        .unwrap(),
+    );
+    let labels = vec![Label::new("host", "a")];
+    let policy = cpu_rollup_policy("cpu_1s_avg", 1_000);
+    let row = |ts: i64| Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(ts, 1.0));
+    storage
+        .insert_rows(&[row(0), row(1_000), row(2_000), row(3_000), row(4_000)])
+        .unwrap();
+    storage.apply_rollup_policies(vec![policy.clone()]).unwrap();
+    storage.insert_rows(&[row(5_000)]).unwrap();
+
+    // The worker holds the rollup run lock and still has a bucket to write.
+    let (started, resume) = block_next_rollup_policy_run(storage.as_ref(), &policy.id);
+    let worker_storage = Arc::clone(&storage);
+    let worker = thread::spawn(move || worker_storage.trigger_rollup_run());
+    started.wait();
+
+    // A write behind the checkpoint has to wait for the worker.
+    let (tx, rx) = mpsc::channel();
+    let late_storage = Arc::clone(&storage);
+    let late_row = row(1_500);
+    let late = thread::spawn(move || {
+        tx.send(late_storage.insert_rows(&[late_row])).unwrap();
+    });
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+    resume.wait();
+    worker
+        .join()
+        .unwrap()
+        .expect("the worker must get a write permit while the late write waits");
+    rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    late.join().unwrap();
+    storage.clear_rollup_policy_start_hook();
+    storage.close().unwrap();
+}
+
+#[test]
 fn policy_apply_waits_for_an_active_worker_and_persists_the_new_set() {
     use std::sync::mpsc;
     use std::thread;
