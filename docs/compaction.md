@@ -91,6 +91,18 @@ across all input chunks for the same series:
 Chunk encoding for output chunks uses the same adaptive codec pipeline as all other
 segments: delta/XOR encoding for timestamps and values, with optional zstd compression.
 
+### Different values at one timestamp
+
+tsink keeps every distinct value written at the same timestamp: compaction drops only
+exact `(ts, value)` duplicates, and reads return all of them. The exception is a read
+over persisted chunks from different levels whose time ranges overlap. There, reads keep
+one value per timestamp and prefer the higher level, so that the inputs of a compaction
+interrupted by a crash do not show up twice. As a consequence, if a flush writes a new
+value at a timestamp that an older, higher-level chunk already holds, reads return both
+values before the flush, only the older value while the two levels overlap, and both
+again once they are compacted together. Don't rely on rewriting a sample at an existing
+timestamp to replace it.
+
 The WAL highwater carried by an output segment is the **maximum** highwater across all
 source segments, allowing the WAL to reclaim space for any data already compacted to
 persistent segments.
