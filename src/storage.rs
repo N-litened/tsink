@@ -1017,6 +1017,7 @@ pub struct StorageBuilder {
     wal_sync_mode: WalSyncMode,
     wal_replay_mode: WalReplayMode,
     background_fail_fast: bool,
+    compaction_on_close: bool,
     metadata_shard_count: Option<u32>,
     #[cfg(test)]
     background_threads_enabled_override: Option<bool>,
@@ -1051,6 +1052,7 @@ impl Default for StorageBuilder {
             wal_sync_mode: WalSyncMode::default(),
             wal_replay_mode: WalReplayMode::Strict,
             background_fail_fast: true,
+            compaction_on_close: true,
             metadata_shard_count: None,
             #[cfg(test)]
             background_threads_enabled_override: None,
@@ -1256,6 +1258,18 @@ impl StorageBuilder {
         self
     }
 
+    /// Controls whether `close()` compacts persisted segments until nothing is left to merge.
+    ///
+    /// Builders default to `true`. With `false`, `close()` still flushes and persists every
+    /// point and waits for a background compaction pass that is already running, but starts no
+    /// compaction of its own, so it returns in about the time of a flush however much work is
+    /// pending. The pending merges run in the background after the next open.
+    #[must_use]
+    pub fn with_compaction_on_close(mut self, enabled: bool) -> Self {
+        self.compaction_on_close = enabled;
+        self
+    }
+
     #[must_use]
     pub fn with_metadata_shard_count(mut self, shard_count: u32) -> Self {
         self.metadata_shard_count = Some(shard_count);
@@ -1413,6 +1427,10 @@ impl StorageBuilder {
 
     pub(crate) fn background_fail_fast(&self) -> bool {
         self.background_fail_fast
+    }
+
+    pub(crate) fn compaction_on_close(&self) -> bool {
+        self.compaction_on_close
     }
 
     pub(crate) fn metadata_shard_count(&self) -> Option<u32> {

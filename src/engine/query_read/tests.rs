@@ -37,6 +37,7 @@ fn test_options(current_time_override: Option<i64>) -> ChunkStorageOptions {
         compaction_interval: DEFAULT_COMPACTION_INTERVAL,
         background_threads_enabled: false,
         background_fail_fast: false,
+        compaction_on_close: true,
         metadata_shard_count: None,
         remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
         remote_segment_refresh_interval: Duration::from_secs(5),

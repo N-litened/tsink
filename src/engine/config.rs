@@ -41,6 +41,7 @@ pub(super) struct ChunkStorageOptions {
     pub(super) compaction_interval: Duration,
     pub(super) background_threads_enabled: bool,
     pub(super) background_fail_fast: bool,
+    pub(super) compaction_on_close: bool,
     pub(super) metadata_shard_count: Option<u32>,
     pub(super) remote_segment_cache_policy: RemoteSegmentCachePolicy,
     pub(super) remote_segment_refresh_interval: Duration,
@@ -80,6 +81,7 @@ impl Default for ChunkStorageOptions {
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
             background_fail_fast: true,
+            compaction_on_close: true,
             metadata_shard_count: None,
             remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
             remote_segment_refresh_interval:
@@ -176,6 +178,7 @@ impl From<&StorageBuilder> for ChunkStorageOptions {
                 }
             },
             background_fail_fast: builder.background_fail_fast(),
+            compaction_on_close: builder.compaction_on_close(),
             metadata_shard_count: builder.metadata_shard_count().filter(|count| *count > 0),
             remote_segment_cache_policy: builder.remote_segment_cache_policy(),
             remote_segment_refresh_interval: builder.remote_segment_refresh_interval(),

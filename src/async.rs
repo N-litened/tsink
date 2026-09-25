@@ -620,6 +620,15 @@ impl AsyncStorageBuilder {
         self
     }
 
+    /// Controls whether `close()` compacts persisted segments until nothing is left to merge.
+    ///
+    /// The underlying storage builder defaults to `true`.
+    #[must_use]
+    pub fn with_compaction_on_close(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.with_compaction_on_close(enabled);
+        self
+    }
+
     pub fn build(self) -> Result<AsyncStorage> {
         let storage = self.inner.build()?;
         AsyncStorage::from_storage_with_options(storage, self.async_options)

@@ -525,6 +525,128 @@ fn close_reconciles_compacted_segments_before_checkpointing_registry() {
         .is_some());
 }
 
+fn close_after_many_small_flushes(compaction_on_close: bool) -> (usize, usize, Vec<i64>) {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "close")];
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        Some(wal),
+        Some(lane_path.clone()),
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_enforced: false,
+            background_threads_enabled: false,
+            compaction_on_close,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    for ts in 0..65 {
+        storage
+            .insert_rows(&[Row::with_labels(
+                "close_compaction",
+                labels.clone(),
+                DataPoint::new(ts, ts as f64),
+            )])
+            .unwrap();
+        storage.flush().unwrap();
+    }
+    let before_close = load_segment_indexes(&lane_path)
+        .unwrap()
+        .indexed_segments
+        .len();
+    storage.close().unwrap();
+    let after_close = load_segment_indexes(&lane_path)
+        .unwrap()
+        .indexed_segments
+        .len();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .build()
+        .unwrap();
+    let timestamps = reopened
+        .select("close_compaction", &labels, 0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|point| point.timestamp)
+        .collect();
+    reopened.close().unwrap();
+    (before_close, after_close, timestamps)
+}
+
+#[test]
+fn close_compacts_pending_segments_by_default() {
+    let (before_close, after_close, timestamps) = close_after_many_small_flushes(true);
+    assert_eq!(before_close, 65);
+    assert!(
+        after_close < before_close,
+        "close should merge the pending segments, found {after_close} of {before_close}"
+    );
+    assert_eq!(timestamps, (0..65).collect::<Vec<_>>());
+}
+
+#[test]
+fn close_without_compaction_leaves_pending_segments_and_keeps_every_point() {
+    let (before_close, after_close, timestamps) = close_after_many_small_flushes(false);
+    assert_eq!(before_close, 65);
+    assert_eq!(after_close, before_close);
+    assert_eq!(timestamps, (0..65).collect::<Vec<_>>());
+}
+
+#[test]
+fn close_without_compaction_waits_for_a_running_background_compaction() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            None,
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                retention_enforced: false,
+                background_threads_enabled: false,
+                compaction_on_close: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    let compaction_guard = storage.compaction_gate();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let closer = std::thread::spawn({
+        let storage = Arc::clone(&storage);
+        move || {
+            let result = storage.close();
+            closed_tx.send(()).unwrap();
+            result
+        }
+    });
+    assert!(
+        closed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "close must not finish while a compaction pass holds the compaction gate"
+    );
+    drop(compaction_guard);
+    closed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    closer.join().unwrap().unwrap();
+}
+
+#[test]
+fn the_builder_passes_compaction_on_close_to_the_engine() {
+    assert!(ChunkStorageOptions::from(&StorageBuilder::new()).compaction_on_close);
+    assert!(
+        !ChunkStorageOptions::from(&StorageBuilder::new().with_compaction_on_close(false))
+            .compaction_on_close
+    );
+}
+
 #[test]
 fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
     let storage = ChunkStorage::new_with_data_path_and_options(
@@ -551,6 +673,7 @@ fn background_flush_seals_rotated_partition_before_reaching_chunk_cap() {
             compaction_interval: DEFAULT_COMPACTION_INTERVAL,
             background_threads_enabled: true,
             background_fail_fast: false,
+            compaction_on_close: true,
             metadata_shard_count: None,
             remote_segment_cache_policy: RemoteSegmentCachePolicy::MetadataOnly,
             remote_segment_refresh_interval: Duration::from_secs(5),

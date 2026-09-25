@@ -28,6 +28,10 @@ impl<'a> LifecycleShutdownContext<'a> {
         self.write_limiter.acquire_all(self.write_timeout)
     }
 
+    fn wait_for_background_compaction(self) {
+        drop(self.compaction_gate());
+    }
+
     fn compact_until_settled(self, max_passes: usize) -> Result<usize> {
         let _compaction_guard = self.compaction_gate();
         let mut passes = 0usize;
@@ -128,7 +132,11 @@ impl ChunkStorage {
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
-        shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?;
+        if self.runtime.compaction_on_close {
+            shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?;
+        } else {
+            shutdown.wait_for_background_compaction();
+        }
         if shutdown.persisted_index_dirty() || self.has_known_persisted_segment_changes() {
             if let Err(err) = self.refresh_dirty_persisted_segments_claimed() {
                 if Self::close_should_defer_dirty_refresh_error(&err) {
