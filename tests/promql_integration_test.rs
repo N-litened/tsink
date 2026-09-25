@@ -972,9 +972,11 @@ fn subquery_returns_range_vectors_and_uses_default_or_explicit_resolution() {
             .unwrap(),
     );
     assert_eq!(explicit.len(), 1);
+    // Steps are absolute multiples of the resolution inside the left-open
+    // window (300, 600], as in Prometheus.
     assert_eq!(
         explicit[0].samples,
-        vec![(300, 300.0), (420, 420.0), (540, 540.0)]
+        vec![(360, 360.0), (480, 480.0), (600, 600.0)]
     );
 
     let defaulted = as_range_vector(

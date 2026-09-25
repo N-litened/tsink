@@ -33,7 +33,10 @@ pub(crate) fn eval_subquery(
         ));
     }
 
-    let start = eval_at.saturating_sub(range);
+    // Like Prometheus, evaluate on the absolute multiples of `step` that fall in
+    // the left-open window `(eval_at - range, eval_at]`.
+    let boundary = eval_at.saturating_sub(range);
+    let start = boundary.saturating_add(step - boundary.rem_euclid(step));
     let mut out: BTreeMap<(String, Vec<crate::Label>), Series> = BTreeMap::new();
     for ts in step_times(start, eval_at, step) {
         let inner_params = QueryParams {
