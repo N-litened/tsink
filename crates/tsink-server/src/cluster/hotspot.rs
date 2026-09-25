@@ -110,9 +110,9 @@ pub fn record_ingest_rows(ring: Option<&ShardRing>, rows: &[Row]) {
     if rows.is_empty() {
         return;
     }
-    with_hotspot_tracker(|tracker| {
-        record_ingest_rows_on_tracker(tracker, ring, rows);
-    });
+    // Hash and count outside the process-wide lock; only the sums are added under it.
+    let counts = ingest_row_counts(ring, rows);
+    with_hotspot_tracker(|tracker| apply_ingest_row_counts(tracker, &counts));
 }
 
 pub fn record_query_plan(candidate_shards: &[u32]) {
@@ -177,7 +177,7 @@ pub(crate) fn hotspot_tracker_snapshot_for_rows(
     rows: &[Row],
 ) -> HotspotTrackerSnapshot {
     let mut tracker = HotspotTracker::default();
-    record_ingest_rows_on_tracker(&mut tracker, ring, rows);
+    apply_ingest_row_counts(&mut tracker, &ingest_row_counts(ring, rows));
     hotspot_tracker_snapshot_from_tracker(&tracker)
 }
 
@@ -460,22 +460,39 @@ fn with_hotspot_tracker<T>(mut f: impl FnMut(&mut HotspotTracker) -> T) -> T {
     f(&mut guard)
 }
 
-fn record_ingest_rows_on_tracker(
-    tracker: &mut HotspotTracker,
-    ring: Option<&ShardRing>,
-    rows: &[Row],
-) {
-    for row in rows {
-        let tenant_id = tenant_id_from_labels(row.labels()).to_string();
-        let tenant = tracker.tenants.entry(tenant_id).or_default();
-        tenant.ingest_rows_total = tenant.ingest_rows_total.saturating_add(1);
+/// Ingested rows per tenant and per shard.
+struct IngestRowCounts<'a> {
+    tenants: BTreeMap<&'a str, u64>,
+    shards: BTreeMap<u32, u64>,
+}
 
+fn ingest_row_counts<'a>(ring: Option<&ShardRing>, rows: &'a [Row]) -> IngestRowCounts<'a> {
+    let mut counts = IngestRowCounts {
+        tenants: BTreeMap::new(),
+        shards: BTreeMap::new(),
+    };
+    for row in rows {
+        *counts
+            .tenants
+            .entry(tenant_id_from_labels(row.labels()))
+            .or_default() += 1;
         if let Some(ring) = ring {
             let shard =
                 ring.shard_for_series_id(stable_series_identity_hash(row.metric(), row.labels()));
-            let shard_counters = tracker.shards.entry(shard).or_default();
-            shard_counters.ingest_rows_total = shard_counters.ingest_rows_total.saturating_add(1);
+            *counts.shards.entry(shard).or_default() += 1;
         }
+    }
+    counts
+}
+
+fn apply_ingest_row_counts(tracker: &mut HotspotTracker, counts: &IngestRowCounts<'_>) {
+    for (&tenant_id, &rows) in &counts.tenants {
+        let tenant = tracker.tenants.entry(tenant_id.to_string()).or_default();
+        tenant.ingest_rows_total = tenant.ingest_rows_total.saturating_add(rows);
+    }
+    for (&shard, &rows) in &counts.shards {
+        let shard_counters = tracker.shards.entry(shard).or_default();
+        shard_counters.ingest_rows_total = shard_counters.ingest_rows_total.saturating_add(rows);
     }
 }
 
@@ -637,4 +654,30 @@ fn unix_timestamp_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tsink::DataPoint;
+
+    #[test]
+    fn ingest_rows_are_counted_per_tenant() {
+        let row = |tenant: Option<&str>| {
+            let labels = tenant
+                .map(|tenant| vec![Label::new(tenant::TENANT_LABEL, tenant)])
+                .unwrap_or_default();
+            Row::with_labels("cpu", labels, DataPoint::new(1, 1.0))
+        };
+        let rows = [row(Some("acme")), row(None), row(Some("acme"))];
+
+        let snapshot = hotspot_tracker_snapshot_for_rows(None, &rows);
+        let mut tenants = snapshot
+            .tenants
+            .iter()
+            .map(|tenant| (tenant.tenant_id.as_str(), tenant.ingest_rows_total))
+            .collect::<Vec<_>>();
+        tenants.sort();
+        assert_eq!(tenants, vec![("acme", 2), ("default", 1)]);
+    }
 }
