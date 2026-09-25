@@ -6,7 +6,7 @@ use super::{
     saturating_u64_from_usize, ChunkStorage, PersistedTierFetchStats, RawSeriesPagination,
 };
 use crate::query_aggregation::{
-    aggregate_series, downsample_points, downsample_points_with_custom,
+    aggregate_series, bucket_start_for_origin, downsample_points, downsample_points_with_custom,
     downsample_points_with_origin,
 };
 use crate::validation::{validate_labels, validate_metric};
@@ -188,7 +188,13 @@ impl ChunkStorage {
                         opts.start,
                         opts.end,
                     ) {
-                        let covered_end = candidate.materialized_through.min(opts.end);
+                        // A rollup point at `b` covers `[b, b + interval)`, so only buckets
+                        // that end by the query end come from the rollup; the rest is raw.
+                        let covered_end = bucket_start_for_origin(
+                            candidate.materialized_through.min(opts.end),
+                            candidate.policy.bucket_origin,
+                            downsample.interval,
+                        );
                         if covered_end > opts.start {
                             let rollup_plan = context.query_tier_plan(opts.start, covered_end);
                             let mut rollup_points = Vec::new();

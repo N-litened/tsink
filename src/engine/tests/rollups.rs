@@ -200,6 +200,56 @@ fn durable_rollups_survive_restart_and_power_aligned_downsample_queries() {
 }
 
 #[test]
+fn rollup_queries_with_an_unaligned_end_downsample_the_last_bucket_from_raw_points() {
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let storage = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Milliseconds)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(
+            &[(1, 1.0), (6, 100.0), (12, 7.0), (17, 1_000.0), (105, 0.0)].map(|(ts, value)| {
+                Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(ts, value))
+            }),
+        )
+        .unwrap();
+    let snapshot = storage
+        .apply_rollup_policies(vec![crate::storage::RollupPolicy {
+            id: "cpu_10ms_sum".to_string(),
+            metric: "cpu_usage".to_string(),
+            match_labels: Vec::new(),
+            interval: 10,
+            aggregation: Aggregation::Sum,
+            bucket_origin: 0,
+        }])
+        .unwrap();
+    assert_eq!(snapshot.policies[0].materialized_through, Some(100));
+
+    let downsample = |end: i64| {
+        storage
+            .select_with_options(
+                "cpu_usage",
+                QueryOptions::new(0, end)
+                    .with_labels(labels.clone())
+                    .with_downsample(10, Aggregation::Sum),
+            )
+            .unwrap()
+    };
+    assert_eq!(downsample(5), vec![DataPoint::new(0, 1.0)]);
+    assert_eq!(
+        downsample(15),
+        vec![DataPoint::new(0, 101.0), DataPoint::new(10, 7.0)]
+    );
+    assert_eq!(
+        downsample(20),
+        vec![DataPoint::new(0, 101.0), DataPoint::new(10, 1_007.0)]
+    );
+    storage.close().unwrap();
+}
+
+#[test]
 fn crash_recovery_does_not_rewrite_already_materialized_rollup_buckets() {
     let temp_dir = TempDir::new().unwrap();
     let labels = vec![Label::new("host", "a")];
