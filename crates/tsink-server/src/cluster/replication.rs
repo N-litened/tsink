@@ -438,6 +438,10 @@ impl ConsistencyFailure {
 struct WriteCoordinatorState {
     mode: ClusterWriteConsistency,
     shards: BTreeMap<u32, CoordinatorShardState>,
+    /// Remote batches still outstanding per (shard, owner). One owner's rows can be split
+    /// into several batches, and the owner acknowledges a shard only once all of them
+    /// have succeeded; its first failed batch counts as one failed replica.
+    remote_batches_pending: BTreeMap<(u32, String), usize>,
 }
 
 impl WriteCoordinatorState {
@@ -455,7 +459,56 @@ impl WriteCoordinatorState {
                 CoordinatorShardState::from_replica_count(replica_count, required_acks),
             );
         }
-        Self { mode, shards }
+        Self {
+            mode,
+            shards,
+            remote_batches_pending: BTreeMap::new(),
+        }
+    }
+
+    fn register_remote_batch<'a>(&mut self, owner: &str, shards: impl Iterator<Item = &'a u32>) {
+        for shard in shards {
+            *self
+                .remote_batches_pending
+                .entry((*shard, owner.to_string()))
+                .or_default() += 1;
+        }
+    }
+
+    fn record_remote_success<'a>(&mut self, owner: &str, shards: impl Iterator<Item = &'a u32>) {
+        for shard in shards {
+            let key = (*shard, owner.to_string());
+            let Some(pending) = self.remote_batches_pending.get_mut(&key) else {
+                // This owner already failed another batch for the shard.
+                continue;
+            };
+            *pending -= 1;
+            if *pending == 0 {
+                self.remote_batches_pending.remove(&key);
+                if let Some(state) = self.shards.get_mut(shard) {
+                    state.record_success();
+                }
+            }
+        }
+    }
+
+    fn record_remote_failure<'a>(
+        &mut self,
+        owner: &str,
+        shards: impl Iterator<Item = &'a u32>,
+        timeout: bool,
+    ) {
+        for shard in shards {
+            if self
+                .remote_batches_pending
+                .remove(&(*shard, owner.to_string()))
+                .is_some()
+            {
+                if let Some(state) = self.shards.get_mut(shard) {
+                    state.record_failure(timeout);
+                }
+            }
+        }
     }
 
     fn record_success_for_shards<'a>(&mut self, shards: impl Iterator<Item = &'a u32>) {
@@ -821,6 +874,9 @@ impl WriteRouter {
 
         let mut coordinator =
             WriteCoordinatorState::new(policy.mode(), policy, &shard_replica_owners);
+        for batch in &remote_batches {
+            coordinator.register_remote_batch(&batch.owner_node_id, batch.shard_row_counts.keys());
+        }
         let mut remote_batches_iter = remote_batches.into_iter();
         let mut remote_tasks = JoinSet::new();
         for _ in 0..self.tuning.max_inflight_remote_batches {
@@ -875,7 +931,10 @@ impl WriteRouter {
                 Ok(()) => {
                     remote_rows_count = remote_rows_count.saturating_add(batch.batch.rows.len());
                     remote_batches_count = remote_batches_count.saturating_add(1);
-                    coordinator.record_success_for_shards(batch.batch.shard_row_counts.keys());
+                    coordinator.record_remote_success(
+                        &batch.batch.owner_node_id,
+                        batch.batch.shard_row_counts.keys(),
+                    );
                 }
                 Err(err) => {
                     let timed_out = matches!(
@@ -894,8 +953,11 @@ impl WriteRouter {
                             return Err(outbox_err);
                         }
                     }
-                    coordinator
-                        .record_failure_for_shards(batch.batch.shard_row_counts.keys(), timed_out);
+                    coordinator.record_remote_failure(
+                        &batch.batch.owner_node_id,
+                        batch.batch.shard_row_counts.keys(),
+                        timed_out,
+                    );
                 }
             }
 
@@ -1226,6 +1288,48 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tsink::{DataPoint, StorageBuilder, TimestampPrecision};
+
+    #[test]
+    fn a_replica_split_into_batches_acknowledges_a_shard_once() {
+        let owners = BTreeMap::from([(
+            7u32,
+            vec![
+                "node-a".to_string(),
+                "node-b".to_string(),
+                "node-c".to_string(),
+            ],
+        )]);
+        let new_coordinator = || {
+            let mut coordinator = WriteCoordinatorState::new(
+                ClusterWriteConsistency::Quorum,
+                WriteAckPolicy::new(ClusterWriteConsistency::Quorum),
+                &owners,
+            );
+            for owner in ["node-a", "node-a", "node-b", "node-c"] {
+                coordinator.register_remote_batch(owner, [7].iter());
+            }
+            coordinator
+        };
+
+        // Both batches to node-a succeed, the other replicas fail: one ack, not two.
+        let mut coordinator = new_coordinator();
+        coordinator.record_remote_success("node-a", [7].iter());
+        coordinator.record_remote_success("node-a", [7].iter());
+        coordinator.record_remote_failure("node-b", [7].iter(), false);
+        coordinator.record_remote_failure("node-c", [7].iter(), false);
+        assert_eq!(coordinator.shards[&7].acknowledged_acks, 1);
+        assert!(coordinator.first_unsatisfied_failure().is_some());
+
+        // node-a stores only one of its batches: it is one failed replica.
+        let mut coordinator = new_coordinator();
+        coordinator.record_remote_success("node-a", [7].iter());
+        coordinator.record_remote_failure("node-a", [7].iter(), false);
+        coordinator.record_remote_success("node-b", [7].iter());
+        assert_eq!(coordinator.shards[&7].acknowledged_acks, 1);
+        assert_eq!(coordinator.shards[&7].max_possible_acks(), 2);
+        coordinator.record_remote_success("node-c", [7].iter());
+        assert!(coordinator.first_unsatisfied_failure().is_none());
+    }
 
     #[test]
     fn quorum_policy_requires_majority() {
