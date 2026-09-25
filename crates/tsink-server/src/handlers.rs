@@ -3611,12 +3611,32 @@ fn preview_handoff_command(
             from_node_id,
             to_node_id,
             activation_ring_version,
-        } => preview.apply_begin_shard_handoff(
-            *shard,
-            from_node_id,
-            to_node_id,
-            *activation_ring_version,
-        )?,
+        } => {
+            // Handing a shard to one of its owners would merge two replicas into one when
+            // the handoff completes. (The rebalance planner shrinks replica sets on purpose
+            // and does not come through here.)
+            let to = to_node_id.trim();
+            let repeats_transition = state.transitions.iter().any(|transition| {
+                transition.shard == *shard
+                    && transition.from_node_id == from_node_id.trim()
+                    && transition.to_node_id == to
+                    && transition.activation_ring_version == *activation_ring_version
+            });
+            if !repeats_transition
+                && state.node_is_owner_for_shard_at_ring_version(*shard, to, state.ring_version)
+            {
+                return Err(format!(
+                    "control command begin_shard_handoff requires to_node_id '{to}' to not already own shard {shard} at ring_version {}",
+                    state.ring_version
+                ));
+            }
+            preview.apply_begin_shard_handoff(
+                *shard,
+                from_node_id,
+                to_node_id,
+                *activation_ring_version,
+            )?
+        }
         InternalControlCommand::UpdateShardHandoff {
             shard,
             phase,
@@ -15652,6 +15672,62 @@ mod tests {
         assert_eq!(body["data"]["result"], "pending");
         assert_eq!(body["data"]["requiredAcks"], 2);
         assert_eq!(body["data"]["acknowledgedAcks"], 1);
+    }
+
+    #[tokio::test]
+    async fn admin_cluster_handoff_rejects_a_destination_that_already_owns_the_shard() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let cluster_context = cluster_context_with_single_node_control_state(&temp_dir, |state| {
+            state
+                .nodes
+                .push(crate::cluster::control::ControlNodeRecord {
+                    id: "node-b".to_string(),
+                    endpoint: "127.0.0.1:9302".to_string(),
+                    membership_generation: 2,
+                    status: ControlNodeStatus::Active,
+                });
+            state.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+            state.leader_node_id = Some("node-a".to_string());
+            state.ring.replication_factor = 2;
+            state.ring.assignments[0] = vec!["node-a".to_string(), "node-b".to_string()];
+        });
+
+        let response = handle_request_with_admin_and_cluster(
+            &storage,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/admin/cluster/handoff/begin".to_string(),
+                headers: HashMap::from([(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                )]),
+                body: serde_json::to_vec(&json!({
+                    "shard": 0,
+                    "fromNodeId": "node-a",
+                    "toNodeId": "node-b",
+                    "activationRingVersion": 2
+                }))
+                .expect("json should encode"),
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+            true,
+            None,
+            None,
+            Some(cluster_context.as_ref()),
+        )
+        .await;
+        assert_eq!(response.status, 409);
+        let state = cluster_context
+            .control_consensus
+            .as_ref()
+            .expect("control consensus should exist")
+            .current_state();
+        assert_eq!(state.owners_for_shard_at_ring_version(0, 2).len(), 2);
+        assert!(state.transitions.is_empty());
     }
 
     #[tokio::test]
