@@ -358,8 +358,9 @@ fn native_histogram(
         negative_spans: Vec::new(),
         negative_deltas: Vec::new(),
         negative_counts: Vec::new(),
+        // Buckets (0.5, 1] and (1, 2].
         positive_spans: vec![HistogramBucketSpan {
-            offset: -1,
+            offset: 0,
             length: 2,
         }],
         positive_deltas: Vec::new(),
@@ -2217,4 +2218,112 @@ fn vector_matching_builds_prometheus_result_labels() {
     let group_left = query("many * on(job) group_left(env) right");
     assert_eq!(group_left.len(), 1);
     assert_eq!(group_left[0].labels, vec![Label::new("job", "a")]);
+}
+
+fn exponential_histogram(sum: f64, offset: i32, counts: Vec<f64>) -> NativeHistogram {
+    NativeHistogram {
+        count: Some(HistogramCount::Float(counts.iter().sum())),
+        sum,
+        schema: 0,
+        zero_threshold: 0.001,
+        zero_count: Some(HistogramCount::Float(0.0)),
+        negative_spans: Vec::new(),
+        negative_deltas: Vec::new(),
+        negative_counts: Vec::new(),
+        positive_spans: vec![HistogramBucketSpan {
+            offset,
+            length: counts.len() as u32,
+        }],
+        positive_deltas: Vec::new(),
+        positive_counts: counts,
+        reset_hint: HistogramResetHint::No,
+        custom_values: Vec::new(),
+    }
+}
+
+#[test]
+fn histogram_quantile_and_fraction_match_prometheus() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    let bucket = |le: &str, count: f64| {
+        Row::with_labels(
+            "latency_seconds_bucket",
+            vec![Label::new("job", "api"), Label::new("le", le)],
+            DataPoint::new(60, count),
+        )
+    };
+    let sqrt2 = std::f64::consts::SQRT_2;
+    storage
+        .insert_rows(&[
+            bucket("1", 10.0),
+            bucket("+Inf", 20.0),
+            // Bucket index 1 of schema 0 is (1, 2].
+            Row::with_labels(
+                "latency_native_seconds",
+                vec![Label::new("job", "one_bucket")],
+                DataPoint::new(60, Value::from(exponential_histogram(0.0, 1, vec![10.0]))),
+            ),
+            Row::with_labels(
+                "latency_native_seconds",
+                vec![Label::new("job", "two_buckets")],
+                DataPoint::new(
+                    60,
+                    Value::from(exponential_histogram(3.0 * sqrt2, 1, vec![1.0, 1.0])),
+                ),
+            ),
+        ])
+        .unwrap();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+    let value = |query: &str| {
+        let samples = as_instant_vector(engine.instant_query(query, 60).unwrap());
+        assert_eq!(samples.len(), 1, "{query}");
+        samples[0].value
+    };
+    let close = |actual: f64, expected: f64| (actual - expected).abs() < 1e-9;
+
+    // A rank in the +Inf bucket returns the highest finite bound.
+    assert_eq!(
+        value("histogram_quantile(0.75, latency_seconds_bucket)"),
+        1.0
+    );
+    // Exponential buckets interpolate on a log scale.
+    assert!(close(
+        value(r#"histogram_quantile(0.5, latency_native_seconds{job="one_bucket"})"#),
+        sqrt2
+    ));
+
+    assert!(close(
+        value("histogram_fraction(0, 1, latency_seconds_bucket)"),
+        0.5
+    ));
+    assert!(close(
+        value("histogram_fraction(0, 0.5, latency_seconds_bucket)"),
+        0.25
+    ));
+    assert_eq!(
+        value("histogram_fraction(1, 0, latency_seconds_bucket)"),
+        0.0
+    );
+    assert!(close(
+        value(&format!(
+            r#"histogram_fraction(1, {sqrt2}, latency_native_seconds{{job="one_bucket"}})"#
+        )),
+        0.5
+    ));
+    assert!(close(
+        value(r#"histogram_fraction(0, 2, latency_native_seconds{job="one_bucket"})"#),
+        1.0
+    ));
+
+    // Observations are estimated at the geometric mean of their bucket.
+    assert!(close(
+        value(r#"histogram_stdvar(latency_native_seconds{job="two_buckets"})"#),
+        0.5
+    ));
+    assert!(close(
+        value(r#"histogram_stddev(latency_native_seconds{job="two_buckets"})"#),
+        0.5f64.sqrt()
+    ));
 }

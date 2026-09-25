@@ -7,8 +7,9 @@ use regex::Regex;
 use crate::promql::ast::{CallExpr, Expr, LabelMatcher, MatchOp};
 use crate::promql::error::{PromqlError, Result};
 use crate::promql::types::{
-    histogram_count_value, histogram_counter_reset_detected, histogram_quantile_native,
-    histogram_scale, histogram_sub, is_stale_nan_value, PromqlValue, Sample,
+    histogram_count_value, histogram_counter_reset_detected, histogram_fraction_native,
+    histogram_quantile_native, histogram_scale, histogram_stdvar_native, histogram_sub,
+    is_stale_nan_value, PromqlValue, Sample,
 };
 
 use super::time::duration_to_units;
@@ -902,11 +903,25 @@ fn eval_histogram_quantile(
     let phi = expect_scalar(engine.eval(&call.args[0], params)?, &call.func)?;
     let vector = expect_instant_vector(engine.eval(&call.args[1], params)?, &call.func)?;
 
+    eval_bucket_function(
+        vector,
+        |histogram| histogram_quantile_native(phi, histogram),
+        |buckets| histogram_quantile_value(phi, buckets),
+    )
+}
+
+/// Applies `native` to each native histogram sample and `classic` to each
+/// group of classic `le` buckets.
+fn eval_bucket_function(
+    vector: Vec<Sample>,
+    native: impl Fn(&crate::NativeHistogram) -> std::result::Result<f64, String>,
+    classic: impl Fn(&mut Vec<(f64, f64)>) -> f64,
+) -> Result<PromqlValue> {
     let mut groups: BTreeMap<Vec<u8>, HistogramBucketGroup> = BTreeMap::new();
     let mut out = Vec::new();
     for sample in vector {
         if let Some(histogram) = sample.histogram() {
-            let value = histogram_quantile_native(phi, histogram).map_err(PromqlError::Eval)?;
+            let value = native(histogram).map_err(PromqlError::Eval)?;
             out.push(Sample::from_float(
                 sample.metric,
                 sample.labels,
@@ -943,7 +958,7 @@ fn eval_histogram_quantile(
     }
 
     for (_, mut group) in groups {
-        let value = histogram_quantile_value(phi, &mut group.buckets);
+        let value = classic(&mut group.buckets);
         out.push(Sample::from_float(
             group.metric,
             group.labels,
@@ -979,6 +994,10 @@ fn eval_histogram_native_unary(
                     histogram.sum / count
                 }
             }
+            "histogram_stdvar" => histogram_stdvar_native(histogram).map_err(PromqlError::Eval)?,
+            "histogram_stddev" => histogram_stdvar_native(histogram)
+                .map_err(PromqlError::Eval)?
+                .sqrt(),
             other => {
                 return Err(PromqlError::Eval(format!(
                     "{other} does not support native histogram samples yet"
@@ -1001,15 +1020,14 @@ fn eval_histogram_fraction(
     params: &QueryParams<'_>,
 ) -> Result<PromqlValue> {
     expect_arg_count(call, 3)?;
-    let _lower = expect_scalar(engine.eval(&call.args[0], params)?, &call.func)?;
-    let _upper = expect_scalar(engine.eval(&call.args[1], params)?, &call.func)?;
+    let lower = expect_scalar(engine.eval(&call.args[0], params)?, &call.func)?;
+    let upper = expect_scalar(engine.eval(&call.args[1], params)?, &call.func)?;
     let vector = expect_instant_vector(engine.eval(&call.args[2], params)?, &call.func)?;
-    if vector.iter().any(|sample| sample.histogram.is_some()) {
-        return Err(PromqlError::Eval(
-            "histogram_fraction does not support native histogram samples yet".to_string(),
-        ));
-    }
-    Ok(PromqlValue::InstantVector(Vec::new()))
+    eval_bucket_function(
+        vector,
+        |histogram| histogram_fraction_native(lower, upper, histogram),
+        |buckets| histogram_fraction_value(lower, upper, buckets),
+    )
 }
 
 fn eval_count_scalar(
@@ -1134,7 +1152,74 @@ fn histogram_group_key(metric: &str, labels: &[Label]) -> Vec<u8> {
     canonical_series_identity(metric, labels)
 }
 
-fn histogram_quantile_value(phi: f64, buckets: &mut [(f64, f64)]) -> f64 {
+/// Sorts `(le, cumulative count)` buckets, merges equal bounds, and makes the
+/// counts monotonic. Returns false unless the buckets end with `+Inf` and
+/// there are at least two of them.
+fn normalize_classic_buckets(buckets: &mut Vec<(f64, f64)>) -> bool {
+    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
+    buckets.dedup_by(|next, kept| {
+        if next.0 == kept.0 {
+            kept.1 += next.1;
+            true
+        } else {
+            false
+        }
+    });
+    for idx in 1..buckets.len() {
+        if buckets[idx].1 < buckets[idx - 1].1 {
+            buckets[idx].1 = buckets[idx - 1].1;
+        }
+    }
+    buckets.len() >= 2
+        && buckets
+            .last()
+            .is_some_and(|bucket| bucket.0 == f64::INFINITY)
+}
+
+/// Port of Prometheus' `BucketFraction`: the estimated fraction of
+/// observations in `(lower, upper]`.
+fn histogram_fraction_value(lower: f64, upper: f64, buckets: &mut Vec<(f64, f64)>) -> f64 {
+    if !normalize_classic_buckets(buckets) {
+        return f64::NAN;
+    }
+    let total = buckets.last().map(|bucket| bucket.1).unwrap_or(0.0);
+    if total.is_nan() || total <= 0.0 || lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    if lower >= upper {
+        return 0.0;
+    }
+
+    // Cumulative count at `value`, interpolated linearly inside a bucket. As in
+    // histogram_quantile, the lowest bucket starts at 0 when its bound is positive.
+    let rank_at = |value: f64| {
+        let mut prev_upper = if buckets[0].0 > 0.0 {
+            0.0
+        } else {
+            f64::NEG_INFINITY
+        };
+        let mut prev_count = 0.0;
+        for &(bucket_upper, count) in buckets.iter() {
+            if value <= prev_upper {
+                return prev_count;
+            }
+            if value < bucket_upper {
+                if prev_upper.is_infinite() || bucket_upper.is_infinite() {
+                    return prev_count;
+                }
+                return prev_count
+                    + (count - prev_count) * (value - prev_upper) / (bucket_upper - prev_upper);
+            }
+            prev_upper = bucket_upper;
+            prev_count = count;
+        }
+        total
+    };
+
+    (rank_at(upper) - rank_at(lower)) / total
+}
+
+fn histogram_quantile_value(phi: f64, buckets: &mut Vec<(f64, f64)>) -> f64 {
     if phi.is_nan() {
         return f64::NAN;
     }
@@ -1148,16 +1233,8 @@ fn histogram_quantile_value(phi: f64, buckets: &mut [(f64, f64)]) -> f64 {
         return f64::NAN;
     }
 
-    buckets.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let last_upper = buckets.last().map(|bucket| bucket.0).unwrap_or(f64::NAN);
-    if !last_upper.is_infinite() || !last_upper.is_sign_positive() {
+    if !normalize_classic_buckets(buckets) {
         return f64::NAN;
-    }
-
-    for idx in 1..buckets.len() {
-        if buckets[idx].1 < buckets[idx - 1].1 {
-            buckets[idx].1 = buckets[idx - 1].1;
-        }
     }
 
     let total = buckets.last().map(|bucket| bucket.1).unwrap_or(0.0);
@@ -1165,14 +1242,12 @@ fn histogram_quantile_value(phi: f64, buckets: &mut [(f64, f64)]) -> f64 {
         return f64::NAN;
     }
 
+    // Like Prometheus, a rank that falls in the +Inf bucket returns the
+    // highest finite bound instead of interpolating toward +Inf.
     let rank = phi * total;
-    if rank >= total {
-        return buckets[buckets.len() - 2].0;
-    }
-
     let mut prev_upper = 0.0;
     let mut prev_count = 0.0;
-    for (idx, (upper, count)) in buckets.iter().copied().enumerate() {
+    for (idx, (upper, count)) in buckets[..buckets.len() - 1].iter().copied().enumerate() {
         if rank <= count {
             if idx == 0 {
                 if upper <= 0.0 || count <= 0.0 {

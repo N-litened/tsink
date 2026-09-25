@@ -356,7 +356,7 @@ All take a range vector and return an instant vector.
 | `histogram_sum(v)` | Sum of observations from native histograms |
 | `histogram_stddev(v)` | Standard deviation from native histograms |
 | `histogram_stdvar(v)` | Variance from native histograms |
-| `histogram_fraction(lower, upper, v)` | Fraction of observations in `(lower, upper]` from native histograms |
+| `histogram_fraction(lower, upper, v)` | Fraction of observations in `(lower, upper]` from classic (bucket-based) or native histograms |
 
 ### Regression and prediction
 

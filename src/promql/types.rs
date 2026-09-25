@@ -267,7 +267,7 @@ pub fn histogram_buckets(histogram: &NativeHistogram) -> Result<Vec<HistogramBuc
             lower: -histogram.zero_threshold,
             upper: histogram.zero_threshold,
             count: zero_count,
-            lower_inclusive: false,
+            lower_inclusive: true,
             upper_inclusive: true,
         });
     }
@@ -296,44 +296,143 @@ pub fn histogram_buckets(histogram: &NativeHistogram) -> Result<Vec<HistogramBuc
     Ok(buckets)
 }
 
+/// Port of Prometheus' `HistogramQuantile` for exponential native histograms.
 pub fn histogram_quantile_native(phi: f64, histogram: &NativeHistogram) -> Result<f64, String> {
-    if phi.is_nan() {
-        return Ok(f64::NAN);
-    }
     if phi < 0.0 {
         return Ok(f64::NEG_INFINITY);
     }
     if phi > 1.0 {
         return Ok(f64::INFINITY);
     }
-
-    let buckets = histogram_buckets(histogram)?;
-    if buckets.is_empty() {
+    let total = histogram_count_value(histogram);
+    if phi.is_nan() || total.is_nan() || total <= 0.0 {
         return Ok(f64::NAN);
     }
 
-    let total = buckets.iter().map(|bucket| bucket.count).sum::<f64>();
-    if !total.is_finite() || total <= 0.0 {
+    let buckets = populated_buckets_with_zero_bucket_edges(histogram)?;
+    let rank = phi * total;
+    let mut count = 0.0;
+    let mut found = None;
+    for bucket in &buckets {
+        count += bucket.count;
+        found = Some(bucket);
+        if count >= rank {
+            break;
+        }
+    }
+    let Some(bucket) = found else {
         return Ok(f64::NAN);
+    };
+    let count = count.min(total);
+    if count < rank {
+        // Only NaN observations are left above the last bucket.
+        return Ok(bucket.upper);
     }
 
-    let target = phi * total;
-    let mut cumulative = 0.0;
-    for bucket in buckets {
-        cumulative += bucket.count;
-        if target > cumulative {
-            continue;
-        }
-        if !bucket.lower.is_finite() || !bucket.upper.is_finite() || bucket.count <= 0.0 {
-            return Ok(bucket.upper);
-        }
-
-        let start = cumulative - bucket.count;
-        let fraction = ((target - start) / bucket.count).clamp(0.0, 1.0);
+    let fraction = (rank - (count - bucket.count)) / bucket.count;
+    if bucket.lower <= 0.0 && bucket.upper >= 0.0 {
+        // The zero bucket is interpolated linearly.
         return Ok(bucket.lower + (bucket.upper - bucket.lower) * fraction);
     }
+    // Exponential buckets are interpolated on a logarithmic scale.
+    let log_lower = bucket.lower.abs().log2();
+    let log_upper = bucket.upper.abs().log2();
+    if bucket.lower > 0.0 {
+        Ok((log_lower + (log_upper - log_lower) * fraction).exp2())
+    } else {
+        Ok(-(log_upper + (log_lower - log_upper) * (1.0 - fraction)).exp2())
+    }
+}
 
-    Ok(f64::NAN)
+/// Port of Prometheus' `HistogramFraction` for exponential native histograms:
+/// the estimated fraction of observations in `(lower, upper]`.
+pub fn histogram_fraction_native(
+    lower: f64,
+    upper: f64,
+    histogram: &NativeHistogram,
+) -> Result<f64, String> {
+    let total = histogram_count_value(histogram);
+    if total.is_nan() || total <= 0.0 || lower.is_nan() || upper.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if lower >= upper {
+        return Ok(0.0);
+    }
+
+    let buckets = populated_buckets_with_zero_bucket_edges(histogram)?;
+    let rank_at = |value: f64| {
+        let mut rank = 0.0;
+        for bucket in &buckets {
+            if bucket.lower >= value {
+                return rank;
+            }
+            if bucket.upper > value {
+                let fraction = if bucket.lower <= 0.0 && bucket.upper >= 0.0 {
+                    (value - bucket.lower) / (bucket.upper - bucket.lower)
+                } else {
+                    let log_lower = bucket.lower.abs().log2();
+                    let log_upper = bucket.upper.abs().log2();
+                    let log_value = value.abs().log2();
+                    if value > 0.0 {
+                        (log_value - log_lower) / (log_upper - log_lower)
+                    } else {
+                        1.0 - (log_value - log_upper) / (log_lower - log_upper)
+                    }
+                };
+                return rank + bucket.count * fraction;
+            }
+            rank += bucket.count;
+        }
+        rank
+    };
+
+    Ok((rank_at(upper).min(total) - rank_at(lower).min(total)) / total)
+}
+
+/// Standard variance of a native histogram, estimating each observation by
+/// its bucket's geometric mean (zero in the zero bucket), as Prometheus does.
+pub fn histogram_stdvar_native(histogram: &NativeHistogram) -> Result<f64, String> {
+    let total = histogram_count_value(histogram);
+    let mean = histogram.sum / total;
+    let mut variance = 0.0;
+    for bucket in histogram_buckets(histogram)? {
+        if bucket.count == 0.0 {
+            continue;
+        }
+        let value = if bucket.lower <= 0.0 && bucket.upper >= 0.0 {
+            0.0
+        } else if bucket.upper < 0.0 {
+            -(bucket.upper * bucket.lower).sqrt()
+        } else {
+            (bucket.upper * bucket.lower).sqrt()
+        };
+        variance += bucket.count * (value - mean) * (value - mean);
+    }
+    Ok(variance / total)
+}
+
+/// The non-empty buckets in ascending order. When the zero bucket is the only
+/// bucket on its side of zero, that side's edge is moved to zero.
+fn populated_buckets_with_zero_bucket_edges(
+    histogram: &NativeHistogram,
+) -> Result<Vec<HistogramBucket>, String> {
+    let buckets = histogram_buckets(histogram)?;
+    let has_negative = buckets.iter().any(|bucket| bucket.upper < 0.0);
+    let has_positive = buckets.iter().any(|bucket| bucket.lower > 0.0);
+    Ok(buckets
+        .into_iter()
+        .filter(|bucket| bucket.count != 0.0)
+        .map(|mut bucket| {
+            if bucket.lower < 0.0 && bucket.upper > 0.0 {
+                if has_positive && !has_negative {
+                    bucket.lower = 0.0;
+                } else if has_negative && !has_positive {
+                    bucket.upper = 0.0;
+                }
+            }
+            bucket
+        })
+        .collect())
 }
 
 fn combine_histograms(
@@ -476,10 +575,11 @@ fn decoded_bucket_values(
     Ok(values)
 }
 
+// As in Prometheus, positive bucket `index` covers `(base^(index-1), base^index]`.
 fn positive_bucket_bounds(schema: i32, index: i32) -> Result<(f64, f64), String> {
     Ok((
+        bucket_boundary(schema, index - 1)?,
         bucket_boundary(schema, index)?,
-        bucket_boundary(schema, index + 1)?,
     ))
 }
 

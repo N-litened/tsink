@@ -291,7 +291,7 @@ These functions take a **range vector** and return an **instant vector**. All re
 | `histogram_avg(v)` | Instant vector (native histograms only) | Average of observations (`sum / count`). |
 | `histogram_stddev(v)` | Instant vector (native histograms only) | Standard deviation derived from a native histogram. |
 | `histogram_stdvar(v)` | Instant vector (native histograms only) | Variance derived from a native histogram. |
-| `histogram_fraction(lower, upper, v)` | Scalars + instant vector | Fraction of observations in `(lower, upper]`. Classic bucket histograms only (native histogram support pending). |
+| `histogram_fraction(lower, upper, v)` | Scalars + instant vector | Fraction of observations in `(lower, upper]`, from classic bucket histograms (using the `le` label) or native histograms. |
 
 **Classic histogram quantile**: `histogram_quantile` expects an instant vector whose series carry an `le` label. It groups series by all labels except `le`, interpolates the quantile within each bucket group, and strips the `le` and `_bucket` suffix from the result metric name.
 
@@ -439,8 +439,7 @@ tsink recognises the Prometheus stale NaN bit pattern (`0x7ff0000000000002`) and
 |---|---|
 | UTF-8 / non-ASCII characters in metric names or label names | Not supported — identifiers are ASCII only |
 | Backtick string literals | Not supported |
-| `histogram_fraction` with native histograms | Pending — works with classic histograms only |
-| `histogram_stddev` / `histogram_stdvar` evaluation | Native histogram support pending |
+| `histogram_quantile`, `histogram_fraction`, `histogram_stddev`, `histogram_stdvar` on native histograms with custom buckets | Not supported |
 | `irate`, `delta`, `idelta`, `changes`, `resets` with native histograms | Not supported |
 
 ---
