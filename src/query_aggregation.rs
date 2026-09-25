@@ -67,6 +67,13 @@ fn numeric_domain(points: &[DataPoint], aggregation: Aggregation) -> Result<Opti
     }
 }
 
+fn inexact_range_error(value_type: &str) -> TsinkError {
+    TsinkError::UnsupportedAggregation {
+        aggregation: aggregation_name(Aggregation::Range).to_string(),
+        value_type: format!("{value_type} (range cannot be represented exactly)"),
+    }
+}
+
 fn numeric_values_f64(points: &[DataPoint], aggregation: Aggregation) -> Result<Vec<f64>> {
     let mut values = Vec::with_capacity(points.len());
     for point in points {
@@ -374,7 +381,8 @@ fn range_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
             }
             let min = values.iter().min().copied().unwrap() as i128;
             let max = values.iter().max().copied().unwrap() as i128;
-            Value::I64((max - min).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+            let range = i64::try_from(max - min).map_err(|_| inexact_range_error("i64"))?;
+            Value::I64(range)
         }
         NumericDomain::U64 => {
             let values: Vec<u64> = points
@@ -427,7 +435,11 @@ fn range_numeric(points: &[DataPoint]) -> Result<Option<Value>> {
                 let (Some(min), Some(max)) = (int_min, int_max) else {
                     return Ok(None);
                 };
-                return Ok(Some(Value::F64((max - min) as f64)));
+                let range = max - min;
+                if range as f64 as i128 != range {
+                    return Err(inexact_range_error("integer"));
+                }
+                return Ok(Some(Value::F64(range as f64)));
             }
 
             let values = numeric_values_f64(points, Aggregation::Range)?;
@@ -766,6 +778,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(max.value, Value::F64(larger_f64));
+    }
+
+    #[test]
+    fn integer_range_rejects_differences_that_cannot_be_represented_exactly() {
+        for points in [
+            vec![
+                DataPoint::new(1, Value::I64(0)),
+                DataPoint::new(2, Value::U64(u64::MAX)),
+            ],
+            vec![
+                DataPoint::new(1, Value::I64(i64::MIN)),
+                DataPoint::new(2, Value::I64(i64::MAX)),
+            ],
+        ] {
+            let err = aggregate_series(&points, Aggregation::Range).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("range cannot be represented exactly"));
+        }
+
+        let points = vec![
+            DataPoint::new(1, Value::I64(-5)),
+            DataPoint::new(2, Value::I64(i64::MAX - 5)),
+        ];
+        assert_eq!(
+            aggregate_series(&points, Aggregation::Range).unwrap(),
+            Some(DataPoint::new(2, Value::I64(i64::MAX)))
+        );
     }
 
     #[test]
