@@ -135,18 +135,16 @@ pub(crate) fn eval_aggregation(
             }
         }
         AggregationOp::LimitK | AggregationOp::LimitRatio => {
+            let limit = if expr.op == AggregationOp::LimitK {
+                Limit::K(aggregation_k_like(engine, expr, params, "limitk")?)
+            } else {
+                Limit::Ratio(aggregation_ratio(engine, expr, params)?)
+            };
             for (_, (_, mut group_samples)) in groups {
                 group_samples.sort_by_key(sample_hash);
-                let selected = match expr.op {
-                    AggregationOp::LimitK => {
-                        let k = aggregation_k_like(engine, expr, params, "limitk")?;
-                        select_limitk(group_samples, k)
-                    }
-                    AggregationOp::LimitRatio => {
-                        let ratio = aggregation_ratio(engine, expr, params)?;
-                        select_limit_ratio(group_samples, ratio)?
-                    }
-                    _ => unreachable!(),
+                let selected = match limit {
+                    Limit::K(k) => select_limitk(group_samples, k),
+                    Limit::Ratio(ratio) => select_limit_ratio(group_samples, ratio)?,
                 };
 
                 for sample in selected {
@@ -270,6 +268,11 @@ fn aggregation_ratio(
             "limit_ratio parameter must evaluate to scalar".to_string(),
         )),
     }
+}
+
+enum Limit {
+    K(usize),
+    Ratio(f64),
 }
 
 enum AggregationValue {

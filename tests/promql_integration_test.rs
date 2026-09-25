@@ -859,6 +859,21 @@ fn additional_aggregations_work() {
     assert_eq!(limit_ratio_pos.len(), 1);
     assert_eq!(limit_ratio_neg.len(), 1);
     assert_ne!(limit_ratio_pos[0].labels, limit_ratio_neg[0].labels);
+
+    // The parameter is evaluated once for all groups, like topk's.
+    let limitk_by_group = as_instant_vector(
+        engine
+            .instant_query(
+                "limitk by (method) (scalar(count(http_requests_total)) - 1, http_requests_total)",
+                600,
+            )
+            .unwrap(),
+    );
+    assert_eq!(limitk_by_group.len(), 2);
+    let err = engine
+        .instant_query("limit_ratio by (method) (2, http_requests_total)", 600)
+        .unwrap_err();
+    assert!(matches!(err, PromqlError::Eval(msg) if msg.contains("limit_ratio")));
 }
 
 #[test]
