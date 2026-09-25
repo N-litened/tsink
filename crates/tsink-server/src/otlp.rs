@@ -67,7 +67,7 @@ pub use generated::opentelemetry::proto::metrics::v1::{
 pub use generated::opentelemetry::proto::resource::v1::Resource;
 
 const OTLP_NO_RECORDED_VALUE_MASK: u32 = 0x1;
-const TENANT_LABEL: &str = "__tenant_id";
+const TENANT_LABEL: &str = crate::tenant::TENANT_LABEL;
 const HISTOGRAM_BUCKET_LABEL: &str = "le";
 const SUMMARY_QUANTILE_LABEL: &str = "quantile";
 const OTEL_SCOPE_NAME_LABEL: &str = "otel_scope_name";

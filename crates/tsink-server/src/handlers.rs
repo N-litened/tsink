@@ -10762,6 +10762,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn otlp_metrics_are_scoped_to_the_writing_tenant() {
+        let storage = make_storage();
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let engine = make_engine(&storage);
+
+        let export = OtlpExportMetricsServiceRequest {
+            resource_metrics: vec![OtlpResourceMetrics {
+                resource: None,
+                scope_metrics: vec![OtlpScopeMetrics {
+                    scope: None,
+                    metrics: vec![OtlpMetric {
+                        name: "system.cpu.time".to_string(),
+                        description: String::new(),
+                        unit: "s".to_string(),
+                        data: Some(otlp_metric::Data::Gauge(OtlpGauge {
+                            data_points: vec![OtlpNumberDataPoint {
+                                attributes: vec![otlp_string_attr("cpu", "0")],
+                                start_time_unix_nano: 1,
+                                time_unix_nano: 1_700_000_000_123_000_000,
+                                value: Some(otlp_number_data_point::Value::AsDouble(12.5)),
+                                exemplars: vec![],
+                                flags: 0,
+                            }],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let mut encoded = Vec::new();
+        export
+            .encode(&mut encoded)
+            .expect("protobuf encode should work");
+
+        let response = handle_request_with_metadata_and_exemplar_store(
+            &storage,
+            &metadata_store,
+            &exemplar_store,
+            &engine,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/v1/metrics".to_string(),
+                headers: HashMap::from([
+                    (
+                        "content-type".to_string(),
+                        "application/x-protobuf".to_string(),
+                    ),
+                    (tenant::TENANT_HEADER.to_string(), "acme".to_string()),
+                ]),
+                body: encoded,
+            },
+            start_time(),
+            TimestampPrecision::Milliseconds,
+        )
+        .await;
+        assert_eq!(response.status, 200);
+
+        assert!(tenant::scoped_storage(storage.clone(), "default")
+            .list_metrics()
+            .unwrap()
+            .is_empty());
+        let acme_series = tenant::scoped_storage(storage.clone(), "acme")
+            .list_metrics()
+            .unwrap();
+        assert_eq!(acme_series.len(), 1);
+        assert_eq!(acme_series[0].name, "system_x2e_cpu_x2e_time");
+        assert!(acme_series[0]
+            .labels
+            .iter()
+            .all(|label| label.name != "__tenant_id"));
+    }
+
+    #[tokio::test]
     async fn otlp_metrics_endpoint_ingests_mainstream_payloads() {
         let storage = make_storage();
         let metadata_store = make_metadata_store(None);
