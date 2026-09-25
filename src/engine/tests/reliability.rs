@@ -1033,3 +1033,61 @@ fn flush_worker_shutdown_skips_self_join_panics() {
         .store(super::super::STORAGE_CLOSED, Ordering::SeqCst);
     std::thread::sleep(Duration::from_millis(25));
 }
+
+#[test]
+fn flush_keeps_the_wal_when_a_new_segment_ancestor_cannot_be_synced() {
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        Some(wal),
+        Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+        None,
+        1,
+        ChunkStorageOptions {
+            timestamp_precision: TimestampPrecision::Seconds,
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[Row::with_labels(
+            "first_segment",
+            labels.clone(),
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    let appended = storage
+        .persisted
+        .wal
+        .as_ref()
+        .unwrap()
+        .current_appended_highwater();
+
+    // The first segment creates segments/L0; its entry in `segments` must be
+    // durable before the flush may delete the WAL.
+    {
+        let segments_root = temp_dir.path().join(NUMERIC_LANE_ROOT).join("segments");
+        let _guard = crate::engine::fs_utils::fail_directory_sync_matching_once(
+            move |path| path == segments_root,
+            "injected segments directory sync failure",
+        );
+        let err = storage.flush_pipeline_once().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("injected segments directory sync failure"));
+    }
+    let wal = storage.persisted.wal.as_ref().unwrap();
+    assert_eq!(wal.current_appended_highwater(), appended);
+    assert_eq!(wal.replay_committed_writes().unwrap().len(), 1);
+
+    storage.flush_pipeline_once().unwrap();
+    assert_eq!(
+        storage.select("first_segment", &labels, 0, 10).unwrap(),
+        vec![DataPoint::new(1, 1.0)]
+    );
+    storage.close().unwrap();
+}

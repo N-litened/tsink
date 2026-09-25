@@ -65,7 +65,7 @@ pub(super) fn write_compaction_replacement_marker(
     };
 
     let marker_dir = compaction_replacement_dir(data_path);
-    fs::create_dir_all(&marker_dir)?;
+    crate::engine::fs_utils::create_dir_all_and_sync_parents(&marker_dir)?;
     let marker_path = replacement_marker_path(data_path);
     let payload = serde_json::to_vec(&marker)?;
     write_file_atomically_and_sync_parent(&marker_path, &payload)?;

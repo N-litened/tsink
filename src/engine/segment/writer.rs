@@ -4,7 +4,8 @@ use std::path::Path;
 
 use crate::engine::chunk::Chunk;
 use crate::engine::fs_utils::{
-    remove_path_if_exists, rename_tmp, sync_dir, sync_parent_dir, write_tmp_and_sync,
+    create_dir_all_and_sync_parents, remove_path_if_exists, rename_tmp, sync_dir, sync_parent_dir,
+    write_tmp_and_sync,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::{Result, TsinkError};
@@ -161,7 +162,9 @@ fn prepare_staging_dir(path: &Path) -> Result<()> {
             "staging directory has no parent".to_string(),
         ));
     };
-    fs::create_dir_all(parent)?;
+    // A new level directory (and any new ancestor) must be durable before the published
+    // segment can be, since a flush deletes the WAL once the segment is published.
+    create_dir_all_and_sync_parents(parent)?;
     remove_path_if_exists(path)?;
     fs::create_dir_all(path)?;
     Ok(())

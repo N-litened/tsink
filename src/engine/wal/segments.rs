@@ -74,7 +74,7 @@ impl FramedWal {
         segment_max_bytes: u64,
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        crate::engine::fs_utils::create_dir_all_and_sync_parents(&dir)?;
 
         let mut segments = collect_wal_segment_files(&dir)?;
         if segments.is_empty() {

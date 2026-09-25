@@ -443,6 +443,28 @@ pub(crate) fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Creates `path` and its missing ancestors, then fsyncs the parent of every
+/// directory it created, so the new directory entries survive a crash.
+pub(crate) fn create_dir_all_and_sync_parents(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(dir) = cursor {
+        if dir.as_os_str().is_empty() || path_exists_no_follow(dir)? {
+            break;
+        }
+        missing.push(dir);
+        cursor = dir.parent();
+    }
+    std::fs::create_dir_all(path)?;
+    for dir in missing.into_iter().rev() {
+        match dir.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent)?,
+            _ => sync_dir(Path::new("."))?,
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         sync_dir(parent)?;
