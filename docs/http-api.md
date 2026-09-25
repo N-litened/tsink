@@ -17,9 +17,9 @@ All paths are relative to the server listen address (e.g. `http://127.0.0.1:9201
 | Scope | Paths | Notes |
 |---|---|---|
 | **Probe** | `/healthz`, `/ready` | Always unauthenticated. |
-| **Internal** | `/internal/v1/*` | mTLS peer-to-peer traffic; validated separately. |
+| **Internal** | `/internal/v1/*` | Cluster peer RPC, served on the same `--listen` socket. Requires the internal auth token (`x-tsink-internal-auth`) or, with `--cluster-internal-mtls-enabled true`, the mTLS peer identity. Public and admin tokens are not accepted. |
 | **Public** | All other non-admin paths | Bearer token or RBAC. |
-| **Admin** | `/api/v1/admin/*` | Requires admin token or elevated RBAC role; must be enabled with `--admin-api-enabled`. |
+| **Admin** | `/api/v1/admin/*` | Requires admin token or elevated RBAC role; must be enabled with `--enable-admin-api`. |
 
 ### Bearer token
 
@@ -480,7 +480,7 @@ cpu_usage,host=web-1 value=42.0 1700000000000000000
 
 ## Admin API
 
-Admin endpoints require `--admin-api-enabled` on the server. All admin requests require the admin bearer token (or a public token if no dedicated admin token is configured).
+Admin endpoints require `--enable-admin-api` on the server, which in turn requires `--admin-auth-token`, `--auth-token` (or their `-file` forms), or `--rbac-config`. All admin requests require the admin bearer token (or a public token if no dedicated admin token is configured).
 
 Mutating admin operations are recorded to the cluster audit log with the actor identity derived from the `Authorization` header. The actor ID can be overridden by passing `x-tsink-actor-id`.
 
@@ -758,31 +758,7 @@ Re-enable a previously disabled service account.
 
 #### `GET /api/v1/admin/secrets/state`
 
-Return current security and secret state (TLS certificate expiry, token rotation status, mTLS materials).
-
-**Response:** `200 application/json`
-
-```json
-{
-  "status": "success",
-  "data": { ... }
-}
-```
-
----
-
-#### `POST /api/v1/admin/secrets/rotate`
-
-Rotate a TLS certificate, bearer token, or mTLS material.
-
-**Request body (JSON):**
-
-| Field | Required | Description |
-|---|---|---|
-| `target` | Yes | Secret target identifier (e.g. `tls`, `admin_token`, `mtls_ca`). |
-| `mode` | Yes | Rotation mode (`replace` or `overlap`). |
-| `new_value` | No | New credential value (if not auto-generated). |
-| `overlap_seconds` | No | Grace period during which the old credential remains valid. |
+Return the rotation state of each managed secret and the security audit ring.
 
 **Response:** `200 application/json`
 
@@ -790,13 +766,46 @@ Rotate a TLS certificate, bearer token, or mTLS material.
 {
   "status": "success",
   "data": {
-    "target": "admin_token",
-    "mode": "overlap",
-    "issuedCredential": "<new-token>",
-    "state": { ... }
+    "enabled": true,
+    "targets": [ { "kind": "token", "target": "publicAuthToken", "generation": 1, ... } ],
+    "auditEntries": [ { "sequence": 1, "target": "publicAuthToken", "operation": "rotate", "outcome": "success", ... } ],
+    "serviceAccounts": null
   }
 }
 ```
+
+`targets` is an array with one snapshot per configured secret; `auditEntries` holds the last 128 reload and rotate operations. See [Secret rotation](secret-rotation.md#inspect-current-state) for the field list.
+
+---
+
+#### `POST /api/v1/admin/secrets/rotate`
+
+Rotate or reload a TLS certificate, bearer token, or mTLS material.
+
+**Request body (JSON):** field names are camelCase; unknown fields are rejected.
+
+| Field | Required | Description |
+|---|---|---|
+| `target` | Yes | `publicAuthToken`, `adminAuthToken`, `clusterInternalAuthToken`, `listenerTls`, or `clusterInternalMtls`. |
+| `mode` | No | `rotate` (default) or `reload`. |
+| `newValue` | No | New token value for a file-backed token target. Omit or `null` to generate one. Must not be empty or start with `{`. Not accepted with `reload`. |
+| `overlapSeconds` | No | Seconds the previous token stays valid (default 300; `0` disables the overlap). |
+
+**Response:** `200 application/json`
+
+```json
+{
+  "status": "success",
+  "data": {
+    "target": "adminAuthToken",
+    "mode": "rotate",
+    "issuedCredential": "<new-token>",
+    "state": { "kind": "token", "target": "adminAuthToken", ... }
+  }
+}
+```
+
+`issuedCredential` is `null` when no new token value was written by the server (TLS targets, `reload`, and exec-backed secrets). Errors return `400` with a plain-text message.
 
 ---
 
@@ -856,7 +865,7 @@ Download a bounded JSON diagnostic snapshot for a tenant. Includes status, usage
 
 ### Cluster management
 
-All cluster endpoints require an active cluster runtime (`--cluster-enabled`). Parameters can be supplied as query params or in a JSON request body using either `snake_case` or `camelCase` field names.
+All cluster endpoints require an active cluster runtime (`--cluster-enabled true`). Parameters can be supplied as query params or in a JSON request body using either `snake_case` or `camelCase` field names.
 
 #### `POST /api/v1/admin/cluster/join`
 

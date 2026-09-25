@@ -73,7 +73,7 @@ Every incoming HTTP request is classified into one of four scopes before authent
 | Scope | Path prefix | Access rule |
 |---|---|---|
 | `Probe` | `/healthz`, `/ready` | Always allowed — no token required. |
-| `Internal` | `/internal/v1/*` | Cluster-peer traffic; authenticated at the transport layer by mTLS or the internal bearer token. Not accessible from the public network. |
+| `Internal` | `/internal/v1/*` | Cluster-peer traffic. Served on the same `--listen` socket as the public API, so reachable wherever that listener is. Requires the internal credential: the internal bearer token (`x-tsink-internal-auth`), or the mTLS peer identity when `--cluster-internal-mtls-enabled true`. Public and admin tokens are not accepted. Restrict access at the network layer too. |
 | `Admin` | `/api/v1/admin/*` | Requires the admin token (or the public token when no separate admin token is configured). Enabled only with `--enable-admin-api`. |
 | `Public` | everything else | Requires the public token when one is configured. |
 
@@ -303,7 +303,7 @@ tsink-server \
 | `--cluster-internal-mtls-cert` | PEM certificate presented by this node when connecting to peers as a client. |
 | `--cluster-internal-mtls-key` | Corresponding PEM private key. |
 
-The same CA bundle is also used as the client-CA on the public listener, so inbound `/internal/v1/*` requests are rejected at the TLS handshake unless they present a certificate signed by the cluster CA. The public listener and the cluster listener share one acceptor; the client-cert requirement applies only when `cluster-internal-mtls` is enabled.
+There is only one listener (`--listen`); `/internal/v1/*` is served on it alongside the public API. When cluster mTLS is enabled, that listener serves TLS (with `--tls-cert`/`--tls-key`, or the node certificate above if those are not set) and uses the same CA bundle as its client CA, so connections are rejected at the TLS handshake unless they present a certificate signed by the cluster CA. Because public and internal traffic share one acceptor, this requirement applies to public API clients too. It applies only when `--cluster-internal-mtls-enabled true` is set.
 
 ### 5.2 Internal bearer token
 
@@ -315,11 +315,11 @@ As an alternative to mTLS, cluster peers can authenticate to each other with a s
 
 The internal token is checked only on `/internal/v1/*` paths. It is never accepted on public endpoints.
 
-> mTLS and the internal bearer token are independent — you can use either, both, or neither (the last option is appropriate when the internal network is trusted, e.g. a private Kubernetes namespace).
+> mTLS and the internal bearer token are independent — you can use either or both, but not neither: with mTLS off, cluster mode fails at startup unless `--cluster-internal-auth-token` or `--cluster-internal-auth-token-file` is set. When both are configured, peers must present both.
 
 ### 5.3 Verified node-ID propagation
 
-When a cluster peer connects over mTLS the server extracts the node ID from the client certificate (Common Name or first DNS SAN label) and stamps it into the internal header `x-tsink-internal-verified-node-id`. This header is **always stripped from inbound requests** before any handler sees it, so it can never be spoofed by an external client.
+When a cluster peer connects over mTLS the server extracts the node ID from the client certificate (Common Name or first DNS SAN label) and stamps it into the internal header `x-tsink-verified-node-id`. This header is **always stripped from inbound requests** before any handler sees it, so it can never be spoofed by an external client.
 
 Similarly, all RBAC-verified identity headers (`x-tsink-rbac-verified`, `x-tsink-auth-principal-id`, `x-tsink-auth-role`, etc.) are stripped on ingress. See §9 for the full list.
 
@@ -381,24 +381,24 @@ Admission budgets are enforced with tokio semaphores. When the budget is exhaust
 
 ## 7. Secret rotation
 
-All security material — bearer tokens and TLS certificates — can be rotated at runtime without restarting the server. The rotation API is available at `POST /api/v1/admin/security/rotate` (requires the admin token and `--enable-admin-api`).
+All security material — bearer tokens and TLS certificates — can be rotated at runtime without restarting the server. The rotation API is available at `POST /api/v1/admin/secrets/rotate`, and the current state at `GET /api/v1/admin/secrets/state` (both require the admin token and `--enable-admin-api`). See [Secret rotation](secret-rotation.md) for request and response formats.
 
 ### 7.1 Rotation targets
 
 | Target | Covers |
 |---|---|
-| `PublicAuthToken` | The public bearer token (`--auth-token` / `--auth-token-file`). |
-| `AdminAuthToken` | The admin bearer token. |
-| `ClusterInternalAuthToken` | The shared internal cluster auth token. |
-| `ListenerTls` | The TLS certificate and key for the public listener. |
-| `ClusterInternalMtls` | The client certificate and key used for cluster peer connections. |
+| `publicAuthToken` | The public bearer token (`--auth-token` / `--auth-token-file`). |
+| `adminAuthToken` | The admin bearer token. |
+| `clusterInternalAuthToken` | The shared internal cluster auth token. |
+| `listenerTls` | The TLS certificate and key for the public listener. |
+| `clusterInternalMtls` | The client certificate and key used for cluster peer connections. |
 
 ### 7.2 Reload vs. rotate
 
 | Mode | Behaviour |
 |---|---|
-| `Reload` | Re-reads the material from its original source (file or exec command). The new material replaces the current one; the previous value is retained as a fallback during the overlap window. |
-| `Rotate` | Invokes the `rotateCommand` from the exec manifest (or generates a new random token) to produce new material, writes it to disk atomically, then reloads. |
+| `reload` | Re-reads the material from its original source (file or exec command). The new material replaces the current one; the previous value is retained as a fallback during the overlap window. |
+| `rotate` | Invokes the `rotateCommand` from the exec manifest (or generates a new random token) to produce new material, writes it to disk atomically, then reloads. |
 
 ### 7.3 Material backends
 
@@ -415,7 +415,7 @@ A secret path is interpreted as:
 }
 ```
 
-`command` is executed to load or reload the current value. `rotateCommand` is executed during a `Rotate` operation; if empty the target is not rotatable via the exec path. This allows integration with any secrets management system (HashiCorp Vault, AWS Secrets Manager via CLI, etc.).
+`command` is executed to load or reload the current value. `rotateCommand` is executed during a `rotate` operation; if empty the target is not rotatable via the exec path. This allows integration with any secrets management system (HashiCorp Vault, AWS Secrets Manager via CLI, etc.).
 
 Atomic file writes during rotation use a unique hidden temporary file followed by `rename`, ensuring no reader ever sees a partial write. On Unix-like systems, rotated token files are written with `0600` permissions.
 
@@ -423,7 +423,7 @@ Atomic file writes during rotation use a unique hidden temporary file followed b
 
 When material is replaced (either by reload or rotation) the previous value is kept alive for a configurable overlap period (default **300 seconds**). During this window the server accepts both the old and the new credential, enabling zero-downtime rotation when clients are updated gradually. After the overlap window expires the old credential is discarded.
 
-The overlap duration can be overridden per rotation call via the `overlap_seconds` request field.
+The overlap duration can be overridden per rotation call via the `overlapSeconds` request field.
 
 ---
 
@@ -466,14 +466,14 @@ A separate in-memory ring of the last **128** entries covers all secret lifecycl
 | Field | Description |
 |---|---|
 | `sequence` | Monotonically increasing event counter. |
-| `timestamp_unix_ms` | Event time. |
-| `target` | Which secret was affected (`PublicAuthToken`, `ListenerTls`, etc.). |
-| `operation` | `Reload` or `Rotate`. |
-| `outcome` | `Success` or `Failure`. |
+| `timestampUnixMs` | Event time. |
+| `target` | Which secret was affected (`publicAuthToken`, `listenerTls`, etc.). |
+| `operation` | `reload` or `rotate`. |
+| `outcome` | `success` or `failure`. |
 | `actor` | Principal that triggered the operation. |
 | `detail` | Error message on failure. |
 
-Query via `GET /api/v1/admin/security/audit`.
+Read the ring from the `auditEntries` array of `GET /api/v1/admin/secrets/state`. There is no separate security audit endpoint.
 
 ### 8.3 Cluster audit log
 
@@ -527,7 +527,7 @@ Several internal headers carry security-sensitive metadata set by the server dur
 | `x-tsink-auth-method` | RBAC engine | `Token`, `ServiceAccount`, or `Oidc`. |
 | `x-tsink-auth-provider` | RBAC engine | OIDC provider name (OIDC path only). |
 | `x-tsink-auth-subject` | RBAC engine | JWT `sub` claim (OIDC path only). |
-| `x-tsink-internal-verified-node-id` | Transport layer | Peer node ID extracted from mTLS client certificate CN / SAN. |
+| `x-tsink-verified-node-id` | Transport layer | Peer node ID extracted from mTLS client certificate CN / SAN. |
 | `x-tsink-public-auth-required` | Security layer | Whether a public auth token is configured. |
 | `x-tsink-public-auth-verified` | Security layer | Whether the request passed public token check. |
 

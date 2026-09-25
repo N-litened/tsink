@@ -21,11 +21,11 @@ Bearer tokens additionally support an **overlap grace period**: immediately afte
 
 ### File-backed (plain)
 
-A plain text file contains the raw credential value. This source supports reload (re-read the file on demand) but **not** autonomous rotation — writing a new value into the file from outside tsink, then calling `reload`, is the typical workflow.
+A plain text file contains the raw credential value. This source supports reload (re-read the file on demand). Rotating a file-backed public or admin token makes tsink generate a new value (or use `newValue`) and write it to the file. For other file-backed secrets tsink does not generate a value, so writing a new value into the file from outside tsink, then calling `reload`, is the typical workflow.
 
 ### Exec-backed (manifest)
 
-A JSON manifest file describes external commands for loading and, optionally, rotating the credential. If the file path argument starts with `{`, tsink parses it as a manifest rather than reading it as a raw value.
+A JSON manifest file describes external commands for loading and, optionally, rotating the credential. If the file's contents start with `{`, tsink parses it as a manifest rather than reading it as a raw value.
 
 ```json
 {
@@ -66,16 +66,16 @@ Inline tokens are supplied directly via a CLI flag (`--auth-token <TOKEN>`). The
 
 | `target` value | Token protected |
 |----------------|----------------|
-| `PublicAuthToken` | Public API endpoints (`Authorization: Bearer …`). |
-| `AdminAuthToken` | Admin API endpoints (`/api/v1/admin/…`). |
-| `ClusterInternalAuthToken` | Cluster peer RPC calls. |
+| `publicAuthToken` | Public API endpoints (`Authorization: Bearer …`). |
+| `adminAuthToken` | Admin API endpoints (`/api/v1/admin/…`). |
+| `clusterInternalAuthToken` | Cluster peer RPC calls. |
 
 ### Overlap grace period
 
-When a bearer token is rotated the previous credential is retained in memory with an expiry timestamp equal to `now + overlap_seconds`. Any request that presents the previous credential is accepted until that expiry, after which only the new credential is valid.
+When a bearer token is rotated the previous credential is retained in memory with an expiry timestamp equal to `now + overlapSeconds`. Any request that presents the previous credential is accepted until that expiry, after which only the new credential is valid.
 
 - **Default:** 300 seconds (5 minutes).
-- **Disable immediately:** set `overlap_seconds` to `0`.
+- **Disable immediately:** set `overlapSeconds` to `0`.
 - The expiry is checked on every authentication attempt; no background task is needed.
 
 ### Reload vs. rotate for file-backed tokens
@@ -86,7 +86,7 @@ When a bearer token is rotated the previous credential is retained in memory wit
 - Generates a new cryptographically random 32-byte token (base64url-encoded) and writes it to the backing file, or
 - Calls `rotateCommand` on exec-backed secrets and then reloads the result.
 
-An explicit `new_value` can be supplied in the request to set an exact token value instead of generating one.
+An explicit `newValue` can be supplied in the request to set an exact token value instead of generating one. It must not be empty and must not start with `{` (a token file starting with `{` would be read as an exec manifest). The cluster internal token is never generated: rotating it requires `newValue` or an exec manifest with `rotateCommand`.
 
 ---
 
@@ -107,7 +107,7 @@ tsink uses rustls. When a reload or rotate is triggered, a new `ServerConfig` an
 
 | `target` value | Material rotated |
 |----------------|-----------------|
-| `ListenerTls` | HTTP listener certificate + key. |
+| `listenerTls` | HTTP listener certificate + key. |
 
 **Reload** re-reads the PEM files from disk without executing any external command. Use this when your certificate authority has already dropped a renewed certificate at the configured path.
 
@@ -121,7 +121,7 @@ tsink uses rustls. When a reload or rotate is triggered, a new `ServerConfig` an
 
 | CLI flag | Description |
 |----------|-------------|
-| `--cluster-internal-mtls-enabled <bool>` | Enable mTLS for intra-cluster RPC. |
+| `--cluster-internal-mtls-enabled <bool>` | Enable mTLS for intra-cluster RPC (`--cluster-internal-mtls-enabled true`). |
 | `--cluster-internal-mtls-ca-cert <PATH>` | CA bundle used to verify peer certificates. |
 | `--cluster-internal-mtls-cert <PATH>` | Client certificate presented on outbound RPC. |
 | `--cluster-internal-mtls-key <PATH>` | Client private key for outbound RPC. |
@@ -132,7 +132,7 @@ When mTLS is enabled all three paths (CA cert, cert, key) are required. Providin
 
 | `target` value | Material rotated |
 |----------------|-----------------|
-| `ClusterInternalMtls` | CA bundle, client cert, and client key for peer RPC. |
+| `clusterInternalMtls` | CA bundle, client cert, and client key for peer RPC. |
 
 RPC clients reload the mTLS material per-request from the managed bundle, so a rotation takes effect on the next outbound call with no connection-level disruption.
 
@@ -140,7 +140,7 @@ RPC clients reload the mTLS material per-request from the managed bundle, so a r
 
 ## Service account token rotation
 
-Service accounts are defined in the RBAC configuration file (see [Security model](security.md)). Each account carries a single `token` value. Rotation replaces that token with a new cryptographically random 32-byte value (base64url-encoded), updates the `last_rotated_unix_ms` timestamp, and persists the change back to the RBAC file.
+Service accounts are defined in the RBAC configuration file (see [Security model](security.md)). Each account carries a single `token` value. Rotation replaces that token with a new cryptographically random 32-byte value (base64url-encoded), updates the `lastRotatedUnixMs` timestamp, and persists the change back to the RBAC file.
 
 Unlike bearer tokens, service account rotation has **no overlap window** — the new token takes effect immediately. Plan rotation windows accordingly.
 
@@ -150,7 +150,7 @@ The new token value is returned in the API response exactly once; it is not stor
 
 ## HTTP API
 
-All rotation and status endpoints require the admin credential.
+All rotation and status endpoints require `--enable-admin-api` and the admin credential.
 
 ### Rotate a secret
 
@@ -162,21 +162,37 @@ POST /api/v1/admin/secrets/rotate
 
 ```json
 {
-  "target": "PublicAuthToken",
+  "target": "publicAuthToken",
   "mode": "rotate",
-  "new_value": null,
-  "overlap_seconds": 300
+  "newValue": null,
+  "overlapSeconds": 300
 }
 ```
 
+Field names are camelCase and unknown fields are rejected.
+
 | Field | Type | Description |
 |-------|------|-------------|
-| `target` | string | One of: `PublicAuthToken`, `AdminAuthToken`, `ClusterInternalAuthToken`, `ListenerTls`, `ClusterInternalMtls`. |
-| `mode` | string | `"reload"` or `"rotate"`. |
-| `new_value` | string \| null | Explicit new token value; omit or set to `null` to generate one. Not applicable for TLS targets. |
-| `overlap_seconds` | integer \| null | Grace period in seconds for the previous bearer token. `null` uses the default (300 s). `0` disables overlap. |
+| `target` | string | Required. One of: `publicAuthToken`, `adminAuthToken`, `clusterInternalAuthToken`, `listenerTls`, `clusterInternalMtls`. |
+| `mode` | string | `"rotate"` (default) or `"reload"`. |
+| `newValue` | string \| null | Explicit new token value; omit or set to `null` to generate one. Must not be empty or start with `{`. Rejected with `"reload"` and for exec-backed secrets. Ignored for TLS targets. |
+| `overlapSeconds` | integer \| null | Grace period in seconds for the previous bearer token. Omitted or `null` uses the default (300 s). `0` disables overlap. |
 
-**Response:** A state snapshot of the rotated target (see below).
+**Response:**
+
+```json
+{
+  "status": "success",
+  "data": {
+    "target": "publicAuthToken",
+    "mode": "rotate",
+    "issuedCredential": "<new-token>",
+    "state": { "kind": "token", "target": "publicAuthToken", "generation": 4, ... }
+  }
+}
+```
+
+`issuedCredential` is the token value the server wrote to the backing file; it is `null` for `reload`, TLS targets, and exec-backed secrets. `state` is the target's snapshot (see below). Errors return `400` with a plain-text message.
 
 ### Rotate a service account token
 
@@ -196,20 +212,23 @@ POST /api/v1/admin/rbac/service_accounts/rotate
 
 ```json
 {
-  "service_account": {
-    "id": "my-service-account",
-    "description": "CI pipeline account",
-    "disabled": false,
-    "created_unix_ms": 1700000000000,
-    "updated_unix_ms": 1700001000000,
-    "last_rotated_unix_ms": 1700001000000,
-    "bindings": [...]
-  },
-  "token": "<new-token>"
+  "status": "success",
+  "data": {
+    "serviceAccount": {
+      "id": "my-service-account",
+      "description": "CI pipeline account",
+      "disabled": false,
+      "createdUnixMs": 1700000000000,
+      "updatedUnixMs": 1700001000000,
+      "lastRotatedUnixMs": 1700001000000,
+      "bindings": [...]
+    },
+    "token": "<new-token>"
+  }
 }
 ```
 
-The `token` field contains the new credential. Store it securely — it will not be returned again.
+The `data.token` field contains the new credential. Store it securely — it will not be returned again.
 
 ### Inspect current state
 
@@ -217,43 +236,54 @@ The `token` field contains the new credential. Store it securely — it will not
 GET /api/v1/admin/secrets/state
 ```
 
-Returns a `SecurityStateSnapshot` that includes one entry per rotation target plus a rolling audit log of the last 128 rotation operations.
+Returns the state of every configured secret in `data.targets` (an array, one snapshot per target) and the rolling audit log of the last 128 reload and rotate operations in `data.auditEntries`.
 
 **Example response (abbreviated):**
 
 ```json
 {
-  "targets": {
-    "PublicAuthToken": {
-      "restart_safe": false,
-      "reloadable": true,
-      "rotatable": true,
-      "generation": 3,
-      "last_loaded_unix_ms": 1700001200000,
-      "last_rotated_unix_ms": 1700001200000,
-      "accepts_previous_credential": true,
-      "previous_credential_expires_unix_ms": 1700001500000
-    },
-    "ListenerTls": {
-      "restart_safe": false,
-      "reloadable": true,
-      "rotatable": false,
-      "generation": 1,
-      "last_loaded_unix_ms": 1700000000000,
-      "last_rotated_unix_ms": null
-    }
-  },
-  "audit": [
-    {
-      "sequence": 7,
-      "timestamp_unix_ms": 1700001200000,
-      "target": "PublicAuthToken",
-      "operation": "rotate",
-      "outcome": "success",
-      "actor": "admin",
-      "detail": null
-    }
-  ]
+  "status": "success",
+  "data": {
+    "enabled": true,
+    "targets": [
+      {
+        "kind": "token",
+        "target": "publicAuthToken",
+        "restartSafe": true,
+        "reloadable": true,
+        "rotatable": true,
+        "generation": 3,
+        "lastLoadedUnixMs": 1700001200000,
+        "lastRotatedUnixMs": 1700001200000,
+        "previousCredentialExpiresUnixMs": 1700001500000,
+        "acceptsPreviousCredential": true,
+        "source": { "path": "/run/secrets/tsink-token", "sourceKind": "file", "rotateSupported": false }
+      },
+      {
+        "kind": "tls",
+        "target": "listenerTls",
+        "restartSafe": true,
+        "reloadable": true,
+        "rotatable": false,
+        "generation": 1,
+        "lastLoadedUnixMs": 1700000000000,
+        "lastRotatedUnixMs": 0,
+        "cert": { "path": "/etc/tsink/server.pem", "sourceKind": "file", "rotateSupported": false },
+        "key": { "path": "/etc/tsink/server.key", "sourceKind": "file", "rotateSupported": false }
+      }
+    ],
+    "auditEntries": [
+      {
+        "sequence": 7,
+        "timestampUnixMs": 1700001200000,
+        "target": "publicAuthToken",
+        "operation": "rotate",
+        "outcome": "success",
+        "actor": "admin"
+      }
+    ],
+    "serviceAccounts": null
+  }
 }
 ```
 
@@ -261,30 +291,32 @@ Returns a `SecurityStateSnapshot` that includes one entry per rotation target pl
 
 | Field | Description |
 |-------|-------------|
-| `restart_safe` | `true` if the token was supplied inline and requires a restart to change. |
+| `kind` | `"token"` for bearer tokens, `"tls"` for TLS targets. |
+| `target` | The rotation target this snapshot describes. |
+| `restartSafe` | `true` if the token comes from a file or exec manifest, so a rotated value survives a restart; `false` for inline tokens. |
 | `reloadable` | `true` if the token can be reloaded without a restart. |
 | `rotatable` | `true` if in-place rotation is supported. |
-| `generation` | Incremented on every reload or rotate. Clients can poll this to detect changes. |
-| `last_loaded_unix_ms` | Unix timestamp (ms) of the most recent successful load. |
-| `last_rotated_unix_ms` | Unix timestamp (ms) of the most recent rotation; `null` if never rotated. |
-| `accepts_previous_credential` | `true` during the overlap window after rotation. |
-| `previous_credential_expires_unix_ms` | When the previous credential expires; `null` if no overlap is active. |
+| `generation` | Incremented each time a reload or rotate changes the value. Clients can poll this to detect changes. |
+| `lastLoadedUnixMs` | Unix timestamp (ms) of the most recent successful load. |
+| `lastRotatedUnixMs` | Unix timestamp (ms) of the most recent rotation; `0` if never rotated. |
+| `acceptsPreviousCredential` | `true` during the overlap window after rotation. |
+| `previousCredentialExpiresUnixMs` | When the previous credential expires; omitted if no overlap is active. |
 
 ---
 
 ## Audit log
 
-Every reload and rotate operation — successful or not — is appended to an in-memory audit buffer.
+Every reload and rotate operation — successful or not — is appended to an in-memory audit buffer, returned as `data.auditEntries` by `GET /api/v1/admin/secrets/state`.
 
 | Field | Description |
 |-------|-------------|
 | `sequence` | Monotonically increasing counter. |
-| `timestamp_unix_ms` | When the operation occurred. |
+| `timestampUnixMs` | When the operation occurred. |
 | `target` | Which secret was affected. |
 | `operation` | `"reload"` or `"rotate"`. |
 | `outcome` | `"success"` or `"failure"`. |
 | `actor` | ID of the principal that triggered the operation, if authenticated. |
-| `detail` | Error message on failure; `null` on success. |
+| `detail` | Error message on failure; omitted on success. |
 
 The security audit buffer holds up to **128 entries** (FIFO eviction). Service account operations are recorded in a separate RBAC audit buffer with a capacity of **256 entries**, accessible via `GET /api/v1/admin/rbac/audit`.
 
@@ -298,8 +330,10 @@ The security audit buffer holds up to **128 entries** (FIFO eviction). Service a
 | `"cannot be rotated without a restart"` | The secret was supplied inline; restart with a file-backed source to enable runtime rotation. |
 | `"is configured inline and cannot be reloaded"` | Same as above, for reload. |
 | `"does not have any rotateCommand hooks configured"` | TLS rotation requires an exec-backed manifest with a `rotateCommand`. |
-| `"does not accept newValue writes"` | Exec-backed secrets manage their own values; supply `new_value: null`. |
-| `"rotation requires an explicit newValue"` | The backing source cannot generate a token automatically; include `new_value` in the request. |
+| `"does not accept newValue writes"` | Exec-backed secrets manage their own values; omit `newValue` or set it to `null`. |
+| `"reload does not accept newValue"` | `newValue` is only valid with `"mode": "rotate"`. |
+| `"rotation requires an explicit newValue"` | The target cannot generate a token automatically (the cluster internal token); include `newValue` in the request. |
+| `"newValue must not be empty"` / `"newValue must not start with '{'"` | The supplied `newValue` was rejected. |
 
 ---
 
@@ -313,13 +347,13 @@ The security audit buffer holds up to **128 entries** (FIFO eviction). Service a
 curl -s -X POST http://localhost:9201/api/v1/admin/secrets/rotate \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"target":"PublicAuthToken","mode":"rotate","overlap_seconds":300}' \
-  | jq '.new_token'      # distribute this value to clients
+  -d '{"target":"publicAuthToken","mode":"rotate","overlapSeconds":300}' \
+  | jq -r '.data.issuedCredential'      # distribute this value to clients
 
 # 2. Update all clients within the 300-second window.
 
 # 3. Confirm the old credential is no longer accepted (overlap expired or use
-#    overlap_seconds:0 on the next rotation to skip the window entirely).
+#    overlapSeconds:0 on the next rotation to skip the window entirely).
 ```
 
 ### Reload a TLS certificate renewed by an external CA
@@ -329,7 +363,7 @@ curl -s -X POST http://localhost:9201/api/v1/admin/secrets/rotate \
 curl -X POST http://localhost:9201/api/v1/admin/secrets/rotate \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"target":"ListenerTls","mode":"reload"}'
+  -d '{"target":"listenerTls","mode":"reload"}'
 ```
 
 ### Rotate a service account token via the API
@@ -339,7 +373,7 @@ NEW_TOKEN=$(curl -s -X POST \
   http://localhost:9201/api/v1/admin/rbac/service_accounts/rotate \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"id":"ci-pipeline"}' | jq -r '.token')
+  -d '{"id":"ci-pipeline"}' | jq -r '.data.token')
 
 # Store $NEW_TOKEN in your secrets manager before it is lost.
 ```
@@ -349,5 +383,5 @@ NEW_TOKEN=$(curl -s -X POST \
 ```bash
 curl -s http://localhost:9201/api/v1/admin/secrets/state \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
-  | jq '.targets.PublicAuthToken | {generation,accepts_previous_credential,previous_credential_expires_unix_ms}'
+  | jq '.data.targets[] | select(.target == "publicAuthToken") | {generation, acceptsPreviousCredential, previousCredentialExpiresUnixMs}'
 ```

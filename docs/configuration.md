@@ -151,33 +151,33 @@ tsink-server --help
 | `--tls-cert <PATH>` | *(none)* | PEM-encoded TLS certificate. Both `--tls-cert` and `--tls-key` must be set to enable TLS. |
 | `--tls-key <PATH>` | *(none)* | PEM-encoded TLS private key. |
 | `--auth-token <TOKEN>` | *(none)* | Static bearer token required on all non-admin requests. |
-| `--auth-token-file <PATH>` | *(none)* | File or exec-based token manifest (JSON). Takes precedence over `--auth-token`. |
+| `--auth-token-file <PATH>` | *(none)* | File or exec-based token manifest (JSON). Mutually exclusive with `--auth-token`. |
 | `--admin-auth-token <TOKEN>` | *(none)* | Static bearer token required on `/api/v1/admin/*` endpoints. |
-| `--admin-auth-token-file <PATH>` | *(none)* | File or exec-based admin token manifest. Takes precedence over `--admin-auth-token`. |
+| `--admin-auth-token-file <PATH>` | *(none)* | File or exec-based admin token manifest. Mutually exclusive with `--admin-auth-token`. |
 | `--tenant-config <PATH>` | *(none)* | JSON file defining per-tenant auth, quotas, and policies. See [Multi-tenancy](multi-tenancy.md). |
 | `--rbac-config <PATH>` | *(none)* | JSON file defining RBAC roles, service accounts, and OIDC settings. See [Security model](security.md). |
-| `--enable-admin-api` | `false` | Expose admin snapshot, restore, and cluster management endpoints. |
+| `--enable-admin-api` | `false` | Expose admin snapshot, restore, and cluster management endpoints. Takes no value. Requires `--admin-auth-token`, `--auth-token` (or their `-file` forms), or `--rbac-config`. |
 | `--admin-path-prefix <PATH>` | *(none)* | Restrict admin file I/O operations to this directory prefix. |
 
 ### 2.5 Cluster
 
-These flags are only relevant when `--cluster-enabled` is set. See [Cluster setup](cluster-setup.md) and [Clustering internals](clustering-internals.md) for deployment guidance.
+These flags are only relevant when `--cluster-enabled true` is set. See [Cluster setup](cluster-setup.md) and [Clustering internals](clustering-internals.md) for deployment guidance.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable cluster mode. |
+| `--cluster-enabled <BOOL>` | `false` | Enable cluster mode. Takes an explicit value: `--cluster-enabled true`. |
 | `--cluster-node-id <ID>` | *(required)* | Stable, unique identifier for this node. Must not change after initial startup. |
-| `--cluster-bind <HOST:PORT>` | *(none)* | Internal RPC bind/advertise address. Peers will connect to this address. |
-| `--cluster-node-role <ROLE>` | `hybrid` | `storage` — data only; `query` — query fan-out only; `hybrid` — both. |
-| `--cluster-seeds <LIST>` | *(none)* | Comma-separated `HOST:PORT` addresses of seed peers for cluster bootstrap. |
+| `--cluster-bind <HOST:PORT>` | *(none)* | Address this node advertises and peers dial. Internal RPC is served on the `--listen` socket, so use a host peers can reach plus the `--listen` port (not `0.0.0.0`). |
+| `--cluster-node-role <ROLE>` | `hybrid` | `storage` or `hybrid` — owns shards; `query` — owns no shards and requires `--storage-mode compute-only`. Every role answers the public query API. |
+| `--cluster-seeds <LIST>` | *(none)* | Comma-separated seed peers for cluster bootstrap, as `node-id@host:port` (or `host:port`, in which case the node id is inferred from the endpoint). |
 | `--cluster-shards <N>` | `128` | Number of logical hash-ring shards. Changing this after data is stored requires a full rebalance. |
 | `--cluster-replication-factor <N>` | `1` | Number of replicas for each shard. |
 | `--cluster-write-consistency <LEVEL>` | `quorum` | `one`, `quorum`, or `all` — how many replicas must acknowledge a write. |
 | `--cluster-read-consistency <LEVEL>` | `eventual` | `eventual`, `quorum`, or `strict` — read consistency level. |
 | `--cluster-read-partial-response <POLICY>` | `allow` | `allow` — return partial results when some shards are unavailable; `deny` — fail the query. |
-| `--cluster-internal-auth-token <TOKEN>` | *(none)* | Shared secret for internal RPC authentication (used when mTLS is not enabled). |
+| `--cluster-internal-auth-token <TOKEN>` | *(none)* | Shared secret for internal RPC authentication. Required (or the `-file` form) when mTLS is not enabled; optional with mTLS. |
 | `--cluster-internal-auth-token-file <PATH>` | *(none)* | File/exec manifest for the internal RPC token. |
-| `--cluster-internal-mtls-enabled` | `false` | Enable mTLS for all internal peer-to-peer RPC. |
+| `--cluster-internal-mtls-enabled <BOOL>` | `false` | Enable mTLS for all internal peer-to-peer RPC (`--cluster-internal-mtls-enabled true`). Requires the three flags below. |
 | `--cluster-internal-mtls-ca-cert <PATH>` | *(none)* | PEM CA bundle for internal mTLS. |
 | `--cluster-internal-mtls-cert <PATH>` | *(none)* | PEM client certificate for internal mTLS. |
 | `--cluster-internal-mtls-key <PATH>` | *(none)* | PEM client key for internal mTLS. |

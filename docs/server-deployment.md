@@ -103,7 +103,7 @@ TLS uses rustls — no OpenSSL is required.
 |---|---|---|
 | `--auth-token TOKEN` | *none* | Bearer token required on all public requests. |
 | `--auth-token-file PATH` | *none* | Load the public Bearer token from a file or exec manifest. Mutually exclusive with `--auth-token`. |
-| `--admin-auth-token TOKEN` | *none* | Bearer token required for `PUT /api/v1/admin/*` endpoints only. |
+| `--admin-auth-token TOKEN` | *none* | Bearer token required for `/api/v1/admin/*` endpoints only. |
 | `--admin-auth-token-file PATH` | *none* | Load the admin Bearer token from a file or exec manifest. Mutually exclusive with `--admin-auth-token`. |
 | `--rbac-config PATH` | *none* | RBAC roles, service accounts, and OIDC mappings (JSON). Supersedes legacy token auth when present. |
 | `--tenant-config PATH` | *none* | Per-tenant authorization quotas and admission policies (JSON). |
@@ -115,7 +115,7 @@ TLS uses rustls — no OpenSSL is required.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--enable-admin-api` | *disabled* | Enable snapshot, restore, rollup, cluster, and RBAC admin endpoints. Requires at least one auth option. |
+| `--enable-admin-api` | *disabled* | Enable snapshot, restore, rollup, cluster, and RBAC admin endpoints. Takes no value. Requires `--admin-auth-token`, `--auth-token` (or their `-file` forms), or `--rbac-config`. |
 | `--admin-path-prefix PATH` | *none* | Restrict admin file-system operations (snapshot/restore) to paths under PATH. Requires `--enable-admin-api`. |
 
 ### Edge sync
@@ -137,17 +137,17 @@ See the [cluster setup guide](cluster-setup.md) for full cluster documentation.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled BOOL` | `false` | Enable cluster mode. |
+| `--cluster-enabled BOOL` | `false` | Enable cluster mode. Takes an explicit value: `--cluster-enabled true`. |
 | `--cluster-node-id ID` | *none* | Stable identifier for this node. |
-| `--cluster-bind HOST:PORT` | *none* | Internal RPC bind/advertise address. |
-| `--cluster-node-role ROLE` | `hybrid` | Node role: `storage`, `query`, or `hybrid`. |
-| `--cluster-seeds HOST:PORT,...` | *none* | Comma-separated seed peers for bootstrap. |
+| `--cluster-bind HOST:PORT` | *none* | Address this node advertises and peers dial. Internal RPC is served on the `--listen` socket, so use a host peers can reach plus the `--listen` port. |
+| `--cluster-node-role ROLE` | `hybrid` | Node role: `storage`, `query`, or `hybrid`. `query` requires `--storage-mode compute-only`. |
+| `--cluster-seeds HOST:PORT,...` | *none* | Comma-separated seed peers for bootstrap, as `node-id@host:port` or `host:port`. |
 | `--cluster-shards N` | *default* | Logical shard count for the consistent hash ring. |
 | `--cluster-replication-factor N` | *default* | Replicas per shard. |
 | `--cluster-write-consistency MODE` | `quorum` | Write consistency: `one`, `quorum`, or `all`. |
 | `--cluster-read-consistency MODE` | `eventual` | Read consistency: `eventual`, `quorum`, or `strict`. |
 | `--cluster-read-partial-response MODE` | `allow` | Partial read policy: `allow` or `deny`. |
-| `--cluster-internal-auth-token TOKEN` | *none* | Shared secret for internal RPC when mTLS is disabled. |
+| `--cluster-internal-auth-token TOKEN` | *none* | Shared secret for internal RPC. Required (or the `-file` form) when mTLS is disabled. |
 | `--cluster-internal-auth-token-file PATH` | *none* | Load the internal RPC token from a file or exec manifest. |
 | `--cluster-internal-mtls-enabled BOOL` | `false` | Enable mTLS for peer-to-peer RPC. |
 | `--cluster-internal-mtls-ca-cert PATH` | *none* | PEM CA bundle for peer certificate verification. |

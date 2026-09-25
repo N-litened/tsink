@@ -19,39 +19,46 @@ A tsink cluster is a group of nodes that share data via consistent-hash-ring sha
 
 ## Quick start: three-node cluster
 
-Start three nodes, each binding to its own data path and internal RPC endpoint:
+Start three nodes on hosts `node-1`, `node-2`, and `node-3`. Each node serves the public API and internal cluster RPC (`/internal/v1/*`) on its `--listen` socket. `--cluster-bind` is not a second listener: it is the address this node advertises and peers dial, so it must be a host name or IP that peers can reach plus the `--listen` port (not `0.0.0.0`). All nodes need the same internal auth token.
 
 ```bash
 # Node 1
 tsink-server \
   --listen 0.0.0.0:9201 \
   --data-path ./var/node1 \
-  --cluster-enabled \
+  --cluster-enabled true \
   --cluster-node-id node-1 \
-  --cluster-bind 0.0.0.0:9211 \
-  --cluster-seeds node-2:9212,node-3:9213 \
+  --cluster-bind node-1:9201 \
+  --cluster-seeds node-2@node-2:9201,node-3@node-3:9201 \
+  --cluster-internal-auth-token-file /etc/tsink/cluster-token \
   --cluster-replication-factor 3
 
 # Node 2
 tsink-server \
-  --listen 0.0.0.0:9202 \
+  --listen 0.0.0.0:9201 \
   --data-path ./var/node2 \
-  --cluster-enabled \
+  --cluster-enabled true \
   --cluster-node-id node-2 \
-  --cluster-bind 0.0.0.0:9212 \
-  --cluster-seeds node-1:9211,node-3:9213 \
+  --cluster-bind node-2:9201 \
+  --cluster-seeds node-1@node-1:9201,node-3@node-3:9201 \
+  --cluster-internal-auth-token-file /etc/tsink/cluster-token \
   --cluster-replication-factor 3
 
 # Node 3
 tsink-server \
-  --listen 0.0.0.0:9203 \
+  --listen 0.0.0.0:9201 \
   --data-path ./var/node3 \
-  --cluster-enabled \
+  --cluster-enabled true \
   --cluster-node-id node-3 \
-  --cluster-bind 0.0.0.0:9213 \
-  --cluster-seeds node-1:9211,node-2:9212 \
+  --cluster-bind node-3:9201 \
+  --cluster-seeds node-1@node-1:9201,node-2@node-2:9201 \
+  --cluster-internal-auth-token-file /etc/tsink/cluster-token \
   --cluster-replication-factor 3
 ```
+
+Write each seed as `node-id@host:port`. Without the `node-id@` prefix the seed's node id is inferred from its endpoint and will not match that peer's `--cluster-node-id`.
+
+These commands listen on all interfaces without a public bearer token. Add `--auth-token-file` (see [Security](security.md)) before exposing the nodes, and restrict who can reach the `--listen` port at the network layer, since `/internal/v1/*` is served there too.
 
 Each node bootstraps by contacting the seed list until the control plane accepts its join. Once all three nodes are active, shard ownership is distributed across them.
 
@@ -59,13 +66,13 @@ Each node bootstraps by contacting the seed list until the control plane accepts
 
 ## CLI flags reference
 
-All cluster flags are only meaningful when `--cluster-enabled` is set.
+All cluster flags are only meaningful when `--cluster-enabled true` is set.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--cluster-enabled` | `false` | Enable cluster mode. |
+| `--cluster-enabled <BOOL>` | `false` | Enable cluster mode. Takes an explicit value: `--cluster-enabled true`. |
 | `--cluster-node-id <ID>` | — | **Required.** Stable, unique identifier for this node (e.g. `node-1`). Must not be `"unknown"`. |
-| `--cluster-bind <HOST:PORT>` | — | **Required.** Internal RPC listen/advertise address. Peers connect here. |
+| `--cluster-bind <HOST:PORT>` | — | **Required.** Address this node advertises and peers dial. Not a listen address: internal RPC is served on the `--listen` socket, so use a host peers can reach plus the `--listen` port. The server warns at startup if the port differs from `--listen` or the host is `0.0.0.0`/`::`. |
 | `--cluster-node-role <ROLE>` | `hybrid` | Node role: `storage`, `query`, or `hybrid`. See [node roles](#node-roles). |
 | `--cluster-seeds <HOST:PORT,...>` | — | Comma-separated list of peer endpoints used for initial join. Format: `host:port` or `node-id@host:port`. |
 | `--cluster-shards <N>` | `128` | Number of logical shards. Must be > 0. Set this once at cluster creation and never change it. |
@@ -73,9 +80,9 @@ All cluster flags are only meaningful when `--cluster-enabled` is set.
 | `--cluster-write-consistency <MODE>` | `quorum` | Write consistency level: `one`, `quorum`, or `all`. |
 | `--cluster-read-consistency <MODE>` | `eventual` | Read consistency level: `eventual`, `quorum`, or `strict`. |
 | `--cluster-read-partial-response <MODE>` | `allow` | Whether to allow partial results when some shards are unavailable: `allow` or `deny`. |
-| `--cluster-internal-auth-token <TOKEN>` | — | Shared-secret token sent on all internal RPC calls. Mutually exclusive with `--cluster-internal-auth-token-file`. |
+| `--cluster-internal-auth-token <TOKEN>` | — | Shared-secret token sent on all internal RPC calls. Required (or the `-file` form) unless mTLS is enabled. Mutually exclusive with `--cluster-internal-auth-token-file`. |
 | `--cluster-internal-auth-token-file <PATH>` | — | Path to a file containing the shared-secret token. Mutually exclusive with `--cluster-internal-auth-token`. |
-| `--cluster-internal-mtls-enabled` | `false` | Enable mTLS for internal RPC. When set, token auth is disabled. Requires the three flags below. |
+| `--cluster-internal-mtls-enabled <BOOL>` | `false` | Enable mTLS for internal RPC (`--cluster-internal-mtls-enabled true`). Requires the three flags below. With mTLS enabled the internal token is optional. |
 | `--cluster-internal-mtls-ca-cert <PATH>` | — | PEM CA bundle used to verify peer certificates. |
 | `--cluster-internal-mtls-cert <PATH>` | — | PEM client certificate presented on outbound RPC. |
 | `--cluster-internal-mtls-key <PATH>` | — | PEM private key for `--cluster-internal-mtls-cert`. |
@@ -84,22 +91,29 @@ All cluster flags are only meaningful when `--cluster-enabled` is set.
 
 ## Node roles
 
-Each node has a role that determines whether it owns data shards and whether it participates in query fanout.
+Each node has a role that determines whether it owns data shards. The role does not decide whether a node answers queries: every role serves the public API, including `/api/v1/query` and the other PromQL endpoints, on its `--listen` socket and fans reads out to the shard owners.
 
-| Role | Owns shards | Handles queries |
+| Role | Owns shards | Answers public queries |
 |---|---|---|
 | `hybrid` (default) | Yes | Yes |
-| `storage` | Yes | Via RPC from query nodes |
-| `query` | No | Yes (routes to storage/hybrid) |
+| `storage` | Yes | Yes |
+| `query` | No | Yes (reads from storage/hybrid nodes) |
 
 **`hybrid`** is appropriate for homogeneous clusters where every node is equal. **`storage` + `query`** separation is useful when you want dedicated query nodes with more memory for merging results, while storage nodes focus on ingest and retention.
 
-A `query`-role node requires at least one `storage` or `hybrid` node in its seed list:
+A `query`-role node must run with `--storage-mode compute-only`, which requires `--object-store-path`. Conversely, `--storage-mode compute-only` in cluster mode requires `--cluster-node-role query`. A query node also needs at least one `storage` or `hybrid` node in its seed list:
 
 ```bash
 tsink-server \
+  --listen 0.0.0.0:9201 \
+  --cluster-enabled true \
+  --cluster-node-id query-1 \
+  --cluster-bind query-1:9201 \
   --cluster-node-role query \
-  --cluster-seeds storage-1:9211,storage-2:9212 \
+  --storage-mode compute-only \
+  --object-store-path /mnt/object-store/tsink \
+  --cluster-seeds storage-1@storage-1:9201,storage-2@storage-2:9201 \
+  --cluster-internal-auth-token-file /etc/tsink/cluster-token \
   ...
 ```
 
@@ -195,7 +209,7 @@ Repair uses a **digest exchange**: each node periodically computes per-shard fin
 | `TSINK_CLUSTER_REPAIR_MAX_RUNTIME_MS_PER_TICK` | `100` | Max wall time per repair tick (ms). |
 | `TSINK_CLUSTER_REPAIR_FAILURE_BACKOFF_SECS` | `30` | Backoff after a failed repair attempt. |
 
-Repair can be paused, resumed, cancelled, or triggered on-demand via the admin API:
+Repair can be paused, resumed, cancelled, or triggered on-demand via the admin API. Admin endpoints need `--enable-admin-api` on the node and the admin bearer token; add `-H "Authorization: Bearer $ADMIN_TOKEN"` to the examples in this guide that omit it.
 
 ```bash
 # Pause repair
@@ -245,22 +259,28 @@ curl http://node-1:9201/api/v1/admin/cluster/rebalance/status
 
 ### Adding a node
 
-1. Start the new node with `--cluster-enabled`, a unique `--cluster-node-id`, and `--cluster-seeds` pointing at existing nodes.
+1. Start the new node with `--cluster-enabled true`, a unique `--cluster-node-id`, a `--cluster-bind` that peers can reach (its host plus its `--listen` port), the cluster's internal auth token (or mTLS flags), and `--cluster-seeds` pointing at existing nodes (`node-id@host:port`).
 2. The new node contacts the seed list and sends a `join` request to the control plane.
 3. Once accepted, the control plane updates the ring and rebalance begins migrating shards to the new node.
 
-You can also trigger the join manually:
+You can also add the node manually. Send the request to the current control leader (other nodes reply `409 not_control_leader` and name the leader), with the new node's id and advertised endpoint:
 
 ```bash
-curl -X POST http://new-node:9201/api/v1/admin/cluster/join
+curl -X POST http://node-1:9201/api/v1/admin/cluster/join \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id":"node-4","endpoint":"node-4:9201"}'
 ```
 
 ### Removing a node
 
-Signal the node to drain its shards before stopping:
+Ask the control leader to drain the node's shards before stopping it:
 
 ```bash
-curl -X POST http://node-to-remove:9201/api/v1/admin/cluster/leave
+curl -X POST http://node-1:9201/api/v1/admin/cluster/leave \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"node_id":"node-to-remove"}'
 ```
 
 This initiates a graceful handoff: the node transfers its shard data to the remaining owners before marking itself as removed. Check handoff status:
@@ -319,7 +339,9 @@ curl -X POST http://node-1:9201/api/v1/admin/cluster/restore
 
 ## Internal security
 
-All inter-node communication runs on the internal RPC port (`--cluster-bind`) under `/internal/v1/*` endpoints. Two mutually-exclusive authentication mechanisms are available.
+All inter-node communication uses the `/internal/v1/*` endpoints, which each node serves on its `--listen` socket alongside the public API. Peers reach them at the address in `--cluster-bind`. These routes are reachable wherever the public listener is, but they require the internal credential: the internal auth token, or an mTLS peer identity when `--cluster-internal-mtls-enabled true` is set. Public and admin bearer tokens are not accepted on them. Restrict who can reach the `--listen` port at the network layer as well.
+
+Cluster mode does not start without internal authentication: with mTLS off, `--cluster-internal-auth-token` or `--cluster-internal-auth-token-file` is required.
 
 ### Shared-secret token (simpler)
 
@@ -339,17 +361,17 @@ tsink-server \
   ...
 ```
 
-The token is sent on every internal RPC call via the `x-tsink-internal-auth` header. Tokens can be rotated at runtime without restart — see the [secret rotation guide](docs/secret-rotation.md).
+The token is sent on every internal RPC call via the `x-tsink-internal-auth` header. Tokens can be rotated at runtime without restart — see the [secret rotation guide](secret-rotation.md).
 
 ### mTLS (recommended for production)
 
-Enable mTLS to authenticate and encrypt all peer-to-peer traffic using certificates. When mTLS is enabled, shared-secret token auth is disabled.
+Enable mTLS to authenticate and encrypt all peer-to-peer traffic using certificates. With mTLS enabled the shared-secret token is optional; if you also set one, peers must present both.
 
-All three paths are required when `--cluster-internal-mtls-enabled` is set:
+All three paths are required when `--cluster-internal-mtls-enabled true` is set:
 
 ```bash
 tsink-server \
-  --cluster-internal-mtls-enabled \
+  --cluster-internal-mtls-enabled true \
   --cluster-internal-mtls-ca-cert /etc/tsink/ca.pem \
   --cluster-internal-mtls-cert    /etc/tsink/node.crt \
   --cluster-internal-mtls-key     /etc/tsink/node.key \
@@ -362,7 +384,9 @@ tsink-server \
 | `--cluster-internal-mtls-cert` | PEM certificate presented by this node on all outbound RPC calls. |
 | `--cluster-internal-mtls-key` | PEM private key for the certificate above. |
 
-mTLS certificates can be rotated at runtime without restart. See the [secret rotation guide](docs/secret-rotation.md).
+Because public and internal traffic share the `--listen` socket, enabling mTLS also serves that socket over TLS (with `--tls-cert`/`--tls-key`, or this node's cluster certificate if those are not set) and requires every connection to it, public API clients included, to present a certificate signed by the cluster CA.
+
+mTLS certificates can be rotated at runtime without restart. See the [secret rotation guide](secret-rotation.md).
 
 ---
 
@@ -424,9 +448,9 @@ curl http://node-1:9201/api/v1/admin/cluster/audit/export
 Before starting a production cluster:
 
 - [ ] Every node has a unique, stable `--cluster-node-id`.
-- [ ] `--cluster-bind` is reachable by all peers on the network.
+- [ ] `--cluster-bind` is a host name or IP all peers can reach, with the `--listen` port (not `0.0.0.0`).
 - [ ] `--cluster-shards` is consistent across all nodes in the cluster.
 - [ ] `--cluster-replication-factor` ≤ number of storage-capable nodes.
-- [ ] Internal auth is configured: either `--cluster-internal-auth-token[|-file]` or `--cluster-internal-mtls-*`.
-- [ ] `--cluster-seeds` lists enough existing nodes for bootstrap (any subset works).
-- [ ] Firewalls allow traffic on both the public `--listen` port and the internal `--cluster-bind` port.
+- [ ] Internal auth is configured: either `--cluster-internal-auth-token[|-file]` or `--cluster-internal-mtls-enabled true` with `--cluster-internal-mtls-*`.
+- [ ] `--cluster-seeds` lists enough existing nodes for bootstrap (any subset works), written as `node-id@host:port`.
+- [ ] Firewalls let peers and clients reach the `--listen` port, which carries both public and internal traffic, and block everyone else.

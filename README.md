@@ -99,13 +99,20 @@ curl 'http://127.0.0.1:9201/api/v1/query?query=http_requests_total'
 Enable clustering with a flag and scale horizontally. tsink handles shard routing, replication, consistency, hinted handoff, repair, and rebalance automatically.
 
 ```bash
+# node-1; start node-2 and node-3 the same way with their own id, bind host, and seeds
 tsink-server \
   --listen 0.0.0.0:9201 \
   --data-path ./var/tsink \
-  --cluster-enabled \
-  --cluster-replication-factor 3 \
-  --cluster-peers node-2:9202,node-3:9203
+  --auth-token-file /etc/tsink/api-token \
+  --cluster-enabled true \
+  --cluster-node-id node-1 \
+  --cluster-bind node-1:9201 \
+  --cluster-seeds node-2@node-2:9201,node-3@node-3:9201 \
+  --cluster-internal-auth-token-file /etc/tsink/cluster-token \
+  --cluster-replication-factor 3
 ```
+
+Each node serves both the API and internal cluster traffic on its `--listen` port. `--cluster-bind` is the address peers use to reach this node, so it names a reachable host and the `--listen` port. All nodes share the same internal token. See [Cluster setup](docs/cluster-setup.md).
 
 ---
 

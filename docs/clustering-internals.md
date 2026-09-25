@@ -39,7 +39,7 @@ This document describes how tsink distributes data across nodes: how the hash ri
 
 ## Architecture overview
 
-A tsink cluster is a set of independent server processes that each run a full embedded storage engine. Each node is identified by a unique string `node_id` and exposes an internal HTTP endpoint for peer-to-peer RPC. There is no shared storage or external coordination service: membership, sharding, and replication are all managed in-process.
+A tsink cluster is a set of independent server processes that each run a full embedded storage engine. Each node is identified by a unique string `node_id` and serves peer-to-peer RPC under `/internal/v1/*` on the same `--listen` HTTP socket as its public API. Peers dial the address the node advertises with `--cluster-bind`. There is no shared storage or external coordination service: membership, sharding, and replication are all managed in-process.
 
 The main runtime types are:
 
@@ -104,7 +104,7 @@ Each known node is represented as a `ClusterNode`:
 ClusterNode { id: String, endpoint: String }
 ```
 
-The local node is always included. The remaining nodes come from the `--cluster-peers` list (seed nodes).
+The local node is always included, with the `--cluster-bind` address as its endpoint. The remaining nodes come from the `--cluster-seeds` list, written as `node-id@host:port` (a seed without `node-id@` gets an id inferred from its endpoint).
 
 **Auto-join:** `AutoJoinRuntime` runs on startup when seed nodes are configured. It periodically calls `control_auto_join` on each seed endpoint until one acknowledges the join, then stops. The probe interval defaults to 3 seconds (`TSINK_CLUSTER_AUTO_JOIN_INTERVAL_SECS`).
 
@@ -116,11 +116,11 @@ Each node has one of three roles:
 
 | Role | Owns shards | Serves queries |
 |---|---|---|
-| `Storage` | Yes | No |
+| `Storage` | Yes | Yes |
 | `Query` | No | Yes |
 | `Hybrid` (default) | Yes | Yes |
 
-Storage and Hybrid nodes are included in the ring and receive data writes. Query-only nodes do not own shards; they are excluded from the ring when it is built for ownership purposes and only fan out read requests to storage nodes.
+The role only decides shard ownership (`ClusterNodeRole::owns_shards()`). Every role answers the public query API on its `--listen` socket. Storage and Hybrid nodes are included in the ring and receive data writes. Query nodes do not own shards; they are excluded from the ring when it is built for ownership purposes and fan out read requests to the storage and hybrid nodes. A Query node must run with `--storage-mode compute-only` and `--object-store-path`.
 
 ---
 
@@ -368,8 +368,8 @@ Writes containing native histograms require `histogram_ingest_v1` and `histogram
 
 Internal API endpoints are protected by two complementary mechanisms:
 
-- **Bearer token** (`x-tsink-internal-auth` header) — a shared secret loaded from `--cluster-internal-auth-token` or a file. All peer requests must include this token.
-- **mTLS** — when `--cluster-internal-mtls-enabled` is set, `RpcClient` uses a dedicated CA, certificate, and private key for peer connections. The verified peer node ID is transmitted in the `x-tsink-verified-node-id` header and cross-checked against the membership view.
+- **Bearer token** (`x-tsink-internal-auth` header) — a shared secret loaded from `--cluster-internal-auth-token` or a file. Startup fails without it unless mTLS is enabled. All peer requests must include this token.
+- **mTLS** — when `--cluster-internal-mtls-enabled true` is set, `RpcClient` uses a dedicated CA, certificate, and private key for peer connections. The verified peer node ID is transmitted in the `x-tsink-verified-node-id` header and cross-checked against the membership view.
 
 TLS is implemented with `rustls` (no OpenSSL). The crypto provider is installed once per process via a `OnceLock`.
 
