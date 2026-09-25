@@ -1303,7 +1303,7 @@ async fn handle_graphite_connection(
                         legacy_ingest::LegacyAdapterKind::Graphite,
                         0,
                     );
-                    return Ok(());
+                    continue;
                 }
             };
         if bytes_read == 0 {
@@ -1394,7 +1394,10 @@ async fn read_graphite_line<R: tokio::io::AsyncBufRead + Unpin>(
     max_line_bytes: usize,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<GraphiteLineRead, String> {
+    // An over-long line is discarded through its newline, so the connection can carry on
+    // with the next line. Only `max_line_bytes + 1` bytes of it are buffered.
     let max_line_bytes = max_line_bytes.max(1);
+    let mut too_long = false;
     loop {
         let available = tokio::select! {
             result = tokio::time::timeout(GRAPHITE_READ_TIMEOUT, reader.fill_buf()) => {
@@ -1407,21 +1410,29 @@ async fn read_graphite_line<R: tokio::io::AsyncBufRead + Unpin>(
             _ = shutdown_rx.changed() => return Ok(GraphiteLineRead::Shutdown),
         };
         if available.is_empty() {
-            return Ok(GraphiteLineRead::Eof);
+            return Ok(if too_long {
+                GraphiteLineRead::TooLong
+            } else {
+                GraphiteLineRead::Eof
+            });
         }
 
         let newline_pos = available.iter().position(|byte| *byte == b'\n');
         let consume_len = newline_pos.map_or(available.len(), |pos| pos + 1);
-        let remaining_capacity = max_line_bytes.saturating_add(1).saturating_sub(line.len());
-        let copy_len = consume_len.min(remaining_capacity);
-        line.extend_from_slice(&available[..copy_len]);
+        if !too_long {
+            let remaining_capacity = max_line_bytes.saturating_add(1).saturating_sub(line.len());
+            let copy_len = consume_len.min(remaining_capacity);
+            line.extend_from_slice(&available[..copy_len]);
+            too_long = line.len() > max_line_bytes;
+        }
         reader.consume(consume_len);
 
-        if line.len() > max_line_bytes {
-            return Ok(GraphiteLineRead::TooLong);
-        }
         if newline_pos.is_some() {
-            return Ok(GraphiteLineRead::Line(line.len()));
+            return Ok(if too_long {
+                GraphiteLineRead::TooLong
+            } else {
+                GraphiteLineRead::Line(line.len())
+            });
         }
     }
 }
@@ -2575,6 +2586,31 @@ mod tests {
 
         assert!(matches!(result, GraphiteLineRead::TooLong));
         assert_eq!(line.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn graphite_line_reader_skips_an_overlong_line_and_reads_the_next() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"abcdefghijkl\nok 1 2\n")
+            .await
+            .expect("line bytes should write");
+        drop(writer);
+
+        let mut reader = tokio::io::BufReader::with_capacity(4, reader);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut line = Vec::new();
+        let result = read_graphite_line(&mut reader, &mut line, 8, &mut shutdown_rx)
+            .await
+            .expect("line read should not fail");
+        assert!(matches!(result, GraphiteLineRead::TooLong));
+
+        line.clear();
+        let result = read_graphite_line(&mut reader, &mut line, 8, &mut shutdown_rx)
+            .await
+            .expect("line read should not fail");
+        assert!(matches!(result, GraphiteLineRead::Line(7)));
+        assert_eq!(line, b"ok 1 2\n");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
