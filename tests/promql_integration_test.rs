@@ -2052,3 +2052,65 @@ fn unary_plus_and_clamp_invalid_bounds_work() {
     );
     assert!(clamped.is_empty());
 }
+
+#[test]
+fn label_replace_anchors_the_regex_and_range_functions_drop_the_metric_name() {
+    let storage = setup_storage();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+
+    let unmatched = as_instant_vector(
+        engine
+            .instant_query(
+                r#"label_replace(http_requests_total{method="GET"}, "dst", "X", "method", "G")"#,
+                600,
+            )
+            .unwrap(),
+    );
+    assert_eq!(unmatched.len(), 1);
+    assert!(unmatched[0].labels.iter().all(|label| label.name != "dst"));
+
+    let matched = as_instant_vector(
+        engine
+            .instant_query(
+                r#"label_replace(http_requests_total{method="GET"}, "dst", "X$1", "method", "G|(GE)T")"#,
+                600,
+            )
+            .unwrap(),
+    );
+    assert!(matched[0]
+        .labels
+        .iter()
+        .any(|label| label.name == "dst" && label.value == "XGE"));
+
+    let err = engine
+        .instant_query(
+            r#"label_replace(http_requests_total, "1bad", "X", "method", ".*")"#,
+            600,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, PromqlError::Eval(msg) if msg.contains("invalid destination label name"))
+    );
+
+    let rate = as_instant_vector(
+        engine
+            .instant_query(r#"rate(http_requests_total{method="GET"}[5m])"#, 600)
+            .unwrap(),
+    );
+    assert_eq!(rate[0].metric, "");
+    let abs = as_instant_vector(
+        engine
+            .instant_query(r#"abs(http_requests_total{method="GET"})"#, 600)
+            .unwrap(),
+    );
+    assert_eq!(abs[0].metric, "");
+    let last = as_instant_vector(
+        engine
+            .instant_query(
+                r#"last_over_time(http_requests_total{method="GET"}[5m])"#,
+                600,
+            )
+            .unwrap(),
+    );
+    assert_eq!(last[0].metric, "http_requests_total");
+}

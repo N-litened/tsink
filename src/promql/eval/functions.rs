@@ -182,7 +182,7 @@ fn eval_rate_like(
             };
 
             out.push(Sample::from_histogram(
-                std::mem::take(&mut s.metric),
+                String::new(),
                 std::mem::take(&mut s.labels),
                 params.eval_time,
                 histogram,
@@ -222,7 +222,7 @@ fn eval_rate_like(
         };
 
         out.push(Sample::from_float(
-            std::mem::take(&mut s.metric),
+            String::new(),
             std::mem::take(&mut s.labels),
             params.eval_time,
             value,
@@ -582,7 +582,11 @@ fn eval_over_time(
         };
 
         out.push(Sample {
-            metric: std::mem::take(&mut s.metric),
+            metric: match kind {
+                // Like Prometheus, only last_over_time keeps the metric name.
+                OverTimeKind::Last => std::mem::take(&mut s.metric),
+                _ => String::new(),
+            },
             labels: std::mem::take(&mut s.labels),
             timestamp: params.eval_time,
             value,
@@ -703,7 +707,7 @@ fn eval_quantile_over_time(
         }
 
         out.push(Sample {
-            metric: std::mem::take(&mut s.metric),
+            metric: String::new(),
             labels: std::mem::take(&mut s.labels),
             timestamp: params.eval_time,
             value: quantile(&mut values, phi),
@@ -744,7 +748,7 @@ fn eval_mad_over_time(
         let mad = quantile(&mut deviations, 0.5);
 
         out.push(Sample {
-            metric: std::mem::take(&mut s.metric),
+            metric: String::new(),
             labels: std::mem::take(&mut s.labels),
             timestamp: params.eval_time,
             value: mad,
@@ -768,7 +772,7 @@ fn eval_deriv(engine: &Engine, call: &CallExpr, params: &QueryParams<'_>) -> Res
         };
 
         out.push(Sample {
-            metric: std::mem::take(&mut s.metric),
+            metric: String::new(),
             labels: std::mem::take(&mut s.labels),
             timestamp: params.eval_time,
             value,
@@ -807,7 +811,7 @@ fn eval_predict_linear(
         let value = slope * x + intercept;
 
         out.push(Sample {
-            metric: std::mem::take(&mut s.metric),
+            metric: String::new(),
             labels: std::mem::take(&mut s.labels),
             timestamp: params.eval_time,
             value,
@@ -846,7 +850,7 @@ fn eval_double_exponential_smoothing(
         };
 
         out.push(Sample {
-            metric: std::mem::take(&mut s.metric),
+            metric: String::new(),
             labels: std::mem::take(&mut s.labels),
             timestamp: params.eval_time,
             value,
@@ -1537,7 +1541,12 @@ fn eval_label_replace(
     let src = expect_string(engine.eval(&call.args[3], params)?, &call.func)?;
     let pattern = expect_string(engine.eval(&call.args[4], params)?, &call.func)?;
 
-    let regex = Regex::new(&pattern).map_err(PromqlError::from)?;
+    if !is_valid_label_name(&dst) {
+        return Err(PromqlError::Eval(format!(
+            "invalid destination label name in label_replace(): {dst}"
+        )));
+    }
+    let regex = Regex::new(&format!("^(?s:{pattern})$")).map_err(PromqlError::from)?;
     let mut out = Vec::with_capacity(vector.len());
 
     for mut sample in vector {
@@ -1548,10 +1557,9 @@ fn eval_label_replace(
             .map(|l| l.value.clone())
             .unwrap_or_default();
 
-        if regex.is_match(&src_val) {
-            let replaced = regex
-                .replace_all(&src_val, replacement.as_str())
-                .to_string();
+        if let Some(captures) = regex.captures(&src_val) {
+            let mut replaced = String::new();
+            captures.expand(&replacement, &mut replaced);
             set_label(&mut sample.labels, &dst, &replaced);
         }
 
@@ -1609,6 +1617,7 @@ fn map_scalar_or_vector(value: PromqlValue, map: impl Fn(f64) -> f64) -> Result<
         PromqlValue::InstantVector(mut vector) => {
             ensure_histogram_free_vector(&vector, "function")?;
             for sample in &mut vector {
+                sample.metric.clear();
                 sample.value = map(sample.value);
             }
             Ok(PromqlValue::InstantVector(vector))
@@ -1946,11 +1955,22 @@ fn natural_cmp(lhs: &str, rhs: &str) -> std::cmp::Ordering {
     left.len().cmp(&right.len())
 }
 
+// An empty value removes the label, as in Prometheus.
 fn set_label(labels: &mut Vec<Label>, name: &str, value: &str) {
+    if value.is_empty() {
+        labels.retain(|l| l.name != name);
+        return;
+    }
     if let Some(label) = labels.iter_mut().find(|l| l.name == name) {
         label.value = value.to_string();
         return;
     }
     labels.push(Label::new(name.to_string(), value.to_string()));
     labels.sort();
+}
+
+fn is_valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
