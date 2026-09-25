@@ -1283,10 +1283,8 @@ impl ReadFanoutExecutor {
         let storage = Arc::clone(storage);
         let selection = selection.clone();
         let shard_scope = MetadataShardScope::new(self.ring.shard_count(), shards.to_vec());
-        let result = tokio::task::spawn_blocking(move || {
-            storage.select_series_in_shards(&selection, &shard_scope)
-        })
-        .await;
+        let result =
+            run_local_read(move || storage.select_series_in_shards(&selection, &shard_scope)).await;
         match result {
             Ok(Ok(series)) => Ok(series),
             Ok(Err(err)) => Err(ReadFanoutError::LocalSelectSeries {
@@ -1305,8 +1303,7 @@ impl ReadFanoutExecutor {
     ) -> Result<Vec<MetricSeries>, ReadFanoutError> {
         let storage = Arc::clone(storage);
         let shard_scope = MetadataShardScope::new(self.ring.shard_count(), shards.to_vec());
-        let result =
-            tokio::task::spawn_blocking(move || storage.list_metrics_in_shards(&shard_scope)).await;
+        let result = run_local_read(move || storage.list_metrics_in_shards(&shard_scope)).await;
         match result {
             Ok(Ok(series)) => Ok(series),
             Ok(Err(err)) => Err(ReadFanoutError::LocalListMetrics {
@@ -1327,8 +1324,7 @@ impl ReadFanoutExecutor {
     ) -> Result<Vec<SeriesPoints>, ReadFanoutError> {
         let storage = Arc::clone(storage);
         let series_count = series.len();
-        let result =
-            tokio::task::spawn_blocking(move || storage.select_many(&series, start, end)).await;
+        let result = run_local_read(move || storage.select_many(&series, start, end)).await;
         match result {
             Ok(Ok(points)) => Ok(points),
             Ok(Err(err)) => Err(ReadFanoutError::LocalSelectBatch {
@@ -1665,6 +1661,17 @@ fn read_merge_error_to_fanout_error(err: MergeLimitError) -> ReadFanoutError {
     ReadFanoutError::MergeLimitExceeded {
         message: err.to_string(),
     }
+}
+
+/// Runs a local storage read on the blocking pool, or inline when the calling thread is
+/// the PromQL read bridge's (see `distributed_storage::in_read_bridge`).
+async fn run_local_read<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    if crate::cluster::distributed_storage::in_read_bridge() {
+        return Ok(read());
+    }
+    tokio::task::spawn_blocking(read).await
 }
 
 #[cfg(test)]

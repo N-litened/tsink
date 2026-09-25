@@ -67,8 +67,26 @@ impl DistributedPromqlReadBridge {
     }
 
     fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        struct ResetFlag(bool);
+        impl Drop for ResetFlag {
+            fn drop(&mut self) {
+                IN_READ_BRIDGE.with(|flag| flag.set(self.0));
+            }
+        }
+        let _reset = ResetFlag(IN_READ_BRIDGE.with(|flag| flag.replace(true)));
         self.runtime_handle.block_on(future)
     }
+}
+
+thread_local! {
+    static IN_READ_BRIDGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is polling a fanout future in the read bridge. That thread already
+/// holds a blocking-pool slot, so local reads must run inline on it: waiting for another
+/// slot deadlocks once every slot is held by such a waiter.
+pub(crate) fn in_read_bridge() -> bool {
+    IN_READ_BRIDGE.with(std::cell::Cell::get)
 }
 
 #[derive(Clone)]
@@ -551,6 +569,7 @@ mod tests {
     use super::*;
     use crate::cluster::config::{ClusterConfig, DEFAULT_CLUSTER_SHARDS};
     use crate::cluster::{ClusterRequestContext, ClusterRuntime};
+    use std::time::Duration;
     use tsink::{StorageBuilder, TimestampPrecision};
 
     fn make_cluster_context() -> ClusterRequestContext {
@@ -566,6 +585,50 @@ mod tests {
             .expect("cluster runtime should bootstrap")
             .expect("cluster runtime should exist");
         ClusterRequestContext::from_runtime(runtime).expect("cluster context should build")
+    }
+
+    #[test]
+    fn bridged_reads_complete_with_a_single_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+        let completed = runtime.block_on(async {
+            let storage = StorageBuilder::new()
+                .with_timestamp_precision(TimestampPrecision::Milliseconds)
+                .with_metadata_shard_count(DEFAULT_CLUSTER_SHARDS)
+                .build()
+                .expect("storage should build");
+            storage
+                .insert_rows(&[Row::with_labels(
+                    "up",
+                    vec![Label::new("job", "prom")],
+                    DataPoint::new(1_700_000_000_000, 1.0),
+                )])
+                .expect("insert should succeed");
+            let context = make_cluster_context();
+            let adapter = DistributedStorageAdapter::new(
+                storage,
+                context.rpc_client.clone(),
+                context.read_fanout.clone(),
+                1,
+                DistributedPromqlReadBridge::from_current_runtime(),
+            );
+            // The query runs on the only blocking thread, as PromQL handlers do.
+            let read = tokio::task::spawn_blocking(move || {
+                adapter.select_all("up", 1_700_000_000_000, 1_700_000_002_000)
+            });
+            tokio::time::timeout(Duration::from_secs(5), read)
+                .await
+                .is_ok()
+        });
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        assert!(
+            completed,
+            "a bridged read waited for a second blocking thread"
+        );
     }
 
     #[tokio::test]
