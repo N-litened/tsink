@@ -539,6 +539,8 @@ fn record_query_pressure(tenant_id: &str, requests: usize, units: usize) {
 
 fn maybe_record_usage(usage_accounting: Option<&UsageAccounting>, record: UsageRecordInput<'_>) {
     if let Some(accounting) = usage_accounting {
+        // Usage is recorded after the work is done, so a ledger failure does not fail the
+        // request; `record` counts and logs it.
         let _ = accounting.record(record);
     }
 }

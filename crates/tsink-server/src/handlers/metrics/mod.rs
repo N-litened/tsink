@@ -802,6 +802,14 @@ fn append_usage_metrics(body: &mut String, snapshot: &crate::usage::UsageLedgerS
         snapshot.storage_reconciliations_total
     ));
     body.push_str(
+        "# HELP tsink_usage_ledger_append_failures_total Usage records that could not be appended to the ledger\n\
+         # TYPE tsink_usage_ledger_append_failures_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_usage_ledger_append_failures_total {}\n",
+        snapshot.append_failures_total
+    ));
+    body.push_str(
         "# HELP tsink_usage_ledger_durable Whether usage accounting is backed by a durable on-disk ledger\n\
          # TYPE tsink_usage_ledger_durable gauge\n",
     );

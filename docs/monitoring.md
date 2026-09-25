@@ -464,6 +464,7 @@ Edge sync ships writes queued on edge/source nodes upstream. Metrics are emitted
 | `tsink_usage_ledger_records_total` | gauge | Durable or in-memory tenant usage ledger records |
 | `tsink_usage_ledger_tenants_total` | gauge | Distinct tenants in the usage ledger |
 | `tsink_usage_ledger_storage_reconciliations_total` | counter | Storage reconciliation snapshots recorded |
+| `tsink_usage_ledger_append_failures_total` | counter | Usage records that could not be appended to the ledger (the request itself still succeeds) |
 | `tsink_usage_ledger_durable` | gauge | `1` when the ledger is backed by a durable on-disk store |
 
 ---

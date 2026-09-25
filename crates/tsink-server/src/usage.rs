@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tsink::{Label, MetricSeries, Storage};
@@ -143,6 +144,8 @@ pub struct UsageLedgerStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_record_unix_ms: Option<u64>,
     pub storage_reconciliations_total: u64,
+    #[serde(default)]
+    pub append_failures_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -268,6 +271,7 @@ pub struct UsageAccounting {
     ledger_path: Option<PathBuf>,
     writer: Mutex<Option<File>>,
     state: Mutex<UsageLedgerState>,
+    append_failures_total: AtomicU64,
 }
 
 impl UsageAccounting {
@@ -302,6 +306,7 @@ impl UsageAccounting {
             ledger_path,
             writer: Mutex::new(writer),
             state: Mutex::new(state),
+            append_failures_total: AtomicU64::new(0),
         }))
     }
 
@@ -310,7 +315,14 @@ impl UsageAccounting {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        ledger_status_from_records(self.ledger_path.as_deref(), &state.records)
+        self.ledger_status_locked(&state)
+    }
+
+    fn ledger_status_locked(&self, state: &UsageLedgerState) -> UsageLedgerStatus {
+        UsageLedgerStatus {
+            append_failures_total: self.append_failures_total.load(Ordering::Relaxed),
+            ..ledger_status_from_records(self.ledger_path.as_deref(), &state.records)
+        }
     }
 
     pub fn record(&self, input: UsageRecordInput<'_>) -> Result<UsageLedgerRecord, String> {
@@ -348,28 +360,15 @@ impl UsageAccounting {
             logical_storage_bytes: input.logical_storage_bytes,
         };
 
-        if self.ledger_path.is_some() {
-            let encoded = serde_json::to_vec(&record)
-                .map_err(|err| format!("failed to encode usage record: {err}"))?;
-            let mut writer = self
-                .writer
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(file) = writer.as_mut() {
-                file.write_all(&encoded).map_err(|err| {
-                    format!(
-                        "failed to append usage ledger {}: {err}",
-                        self.ledger_path
-                            .as_ref()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_default()
-                    )
-                })?;
-                file.write_all(b"\n")
-                    .map_err(|err| format!("failed to write usage ledger newline: {err}"))?;
-                file.flush()
-                    .map_err(|err| format!("failed to flush usage ledger: {err}"))?;
+        if let Err(err) = self.append_to_ledger(&record) {
+            // Usage is recorded after the request's work is done, so a ledger failure does
+            // not fail the request. It is counted (tsink_usage_ledger_append_failures_total)
+            // and logged, with the log thinned out while failures persist.
+            let failures = self.append_failures_total.fetch_add(1, Ordering::Relaxed) + 1;
+            if failures.is_power_of_two() {
+                eprintln!("usage ledger append failed ({failures} failures so far): {err}");
             }
+            return Err(err);
         }
 
         let mut state = self
@@ -378,6 +377,33 @@ impl UsageAccounting {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.records.push(record.clone());
         Ok(record)
+    }
+
+    fn append_to_ledger(&self, record: &UsageLedgerRecord) -> Result<(), String> {
+        if self.ledger_path.is_none() {
+            return Ok(());
+        }
+        let mut encoded = serde_json::to_vec(record)
+            .map_err(|err| format!("failed to encode usage record: {err}"))?;
+        encoded.push(b'\n');
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(file) = writer.as_mut() {
+            file.write_all(&encoded)
+                .and_then(|()| file.flush())
+                .map_err(|err| {
+                    format!(
+                        "failed to append usage ledger {}: {err}",
+                        self.ledger_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub fn report(
@@ -451,7 +477,7 @@ impl UsageAccounting {
                 end_unix_ms,
                 bucket_width,
             },
-            journal: ledger_status_from_records(self.ledger_path.as_deref(), &state.records),
+            journal: self.ledger_status_locked(&state),
             tenants: tenant_summaries,
             buckets: bucket_summaries,
         }
@@ -666,13 +692,19 @@ fn load_usage_ledger(path: &Path) -> Result<UsageLedgerState, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let record = serde_json::from_str::<UsageLedgerRecord>(&line).map_err(|err| {
-            format!(
-                "failed to parse usage ledger line {} from {}: {err}",
-                index + 1,
-                path.display()
-            )
-        })?;
+        // A crash or a failed append can leave a torn line; skip it rather than refuse
+        // to start.
+        let record = match serde_json::from_str::<UsageLedgerRecord>(&line) {
+            Ok(record) => record,
+            Err(err) => {
+                eprintln!(
+                    "skipping unreadable usage ledger line {} in {}: {err}",
+                    index + 1,
+                    path.display()
+                );
+                continue;
+            }
+        };
         next_seq = next_seq.max(record.seq.saturating_add(1));
         records.push(record);
     }
@@ -699,6 +731,7 @@ fn ledger_status_from_records(
         last_sequence: records.last().map(|record| record.seq).unwrap_or(0),
         last_record_unix_ms: records.last().map(|record| record.unix_ms),
         storage_reconciliations_total,
+        append_failures_total: 0,
     }
 }
 
@@ -764,6 +797,25 @@ mod tests {
             .with_timestamp_precision(TimestampPrecision::Milliseconds)
             .build()
             .expect("storage should build")
+    }
+
+    #[test]
+    fn usage_ledger_counts_append_failures_and_skips_torn_lines() {
+        let dir = tempdir().expect("temp dir should build");
+        let ledger_path = dir.path().join(USAGE_LEDGER_DIR).join(USAGE_LEDGER_FILE);
+        fs::create_dir_all(ledger_path.parent().unwrap()).expect("ledger dir should build");
+        fs::write(&ledger_path, "{\"seq\":1,\"unix\n").expect("torn ledger should write");
+        let accounting = UsageAccounting::open(Some(dir.path())).expect("usage store should open");
+        assert_eq!(accounting.ledger_status().records_total, 0);
+
+        // A read-only handle makes every append fail.
+        *accounting.writer.lock().unwrap() =
+            Some(File::open(&ledger_path).expect("ledger should open"));
+        let input =
+            UsageRecordInput::success("team-a", UsageCategory::Query, "instant_query", "query");
+        assert!(accounting.record(input).is_err());
+        assert_eq!(accounting.ledger_status().append_failures_total, 1);
+        assert_eq!(accounting.ledger_status().records_total, 0);
     }
 
     #[test]
