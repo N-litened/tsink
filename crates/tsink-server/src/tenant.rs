@@ -946,6 +946,12 @@ impl TenantRegistry {
         Self::from_json_str(&raw)
     }
 
+    /// Whether the `defaults` policy has no tokens, so `default`, unlisted tenant ids, and
+    /// listed tenants without their own `auth.tokens` have no tenant-level authentication.
+    pub fn defaults_have_no_tokens(&self) -> bool {
+        self.default_template.auth_tokens.is_empty()
+    }
+
     pub fn from_json_str(raw: &str) -> Result<Self, String> {
         let file: TenantPolicyFile = serde_json::from_str(raw)
             .map_err(|err| format!("invalid tenant config JSON: {err}"))?;

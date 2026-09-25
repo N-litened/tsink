@@ -1,6 +1,6 @@
 # Multi-tenancy
 
-tsink's multi-tenancy model gives every tenant a fully isolated data namespace with independent quotas, admission budgets, authentication tokens, and lifecycle state — all sharing a single storage engine with zero cross-tenant data leakage.
+tsink's multi-tenancy model gives every tenant an isolated data namespace with independent quotas, admission budgets, optional authentication tokens, and lifecycle state — all sharing a single storage engine.
 
 ---
 
@@ -173,6 +173,8 @@ The `auth.tokens` list in the tenant config file defines bearer tokens scoped to
 A `write`-scoped token grants write access to that tenant only. A `read`-scoped token grants read access to that tenant only. Tokens cannot cross tenant boundaries.
 
 These per-tenant tokens are evaluated before the global security manager token. See the [security model](security.md) for OIDC and RBAC configuration.
+
+Tenants without their own `auth.tokens` — including `default` and any tenant id not listed in the file, which inherit `defaults` — fall back to the global `--auth-token` / `--auth-token-file`. If there is no global token and no RBAC, those tenants accept unauthenticated reads and writes, and the server prints a warning at startup. Tokens placed in `defaults.auth` apply to every tenant that inherits them. To require a token for every tenant, set tokens in `defaults.auth`, configure a global token, or use RBAC.
 
 ### RBAC tenant resources
 

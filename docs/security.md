@@ -353,6 +353,8 @@ The tenant config file (supplied via `--tenant-config`) supports per-tenant bear
 
 A request carrying a valid per-tenant `Write` token for tenant `acme` is allowed to ingest data into that tenant only; it cannot read data or access other tenants. Per-tenant token auth is evaluated before the global `SecurityManager` token check.
 
+Tenants without their own `auth.tokens` — including `default` and any tenant id not listed in the file, which inherit `defaults` — fall back to the global `--auth-token` / `--auth-token-file`. If there is no global token and no RBAC, those tenants accept unauthenticated reads and writes, and the server prints a warning at startup. Tokens placed in `defaults.auth` apply to every tenant that inherits them.
+
 ### 6.3 Per-tenant request and admission policies
 
 Each tenant can have independent request size limits and concurrency budgets:

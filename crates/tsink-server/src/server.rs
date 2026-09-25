@@ -563,6 +563,22 @@ pub async fn run_server(config: ServerConfig) -> Result<(), String> {
     ServerRuntime::bootstrap(config).await?.run().await
 }
 
+/// Tenants without tokens fall back to the global token, so with neither a global token
+/// nor RBAC they accept unauthenticated requests.
+fn tenant_auth_warning(
+    config: &ServerConfig,
+    tenant_registry: &tenant::TenantRegistry,
+) -> Option<&'static str> {
+    (tenant_registry.defaults_have_no_tokens()
+        && !config.has_public_auth()
+        && config.rbac_config_path.is_none())
+    .then_some(
+        "warning: the tenant config sets no tokens in `defaults` and there is no --auth-token, \
+         --auth-token-file, or --rbac-config, so the default tenant, unlisted tenant ids, and \
+         tenants without their own auth.tokens accept unauthenticated requests",
+    )
+}
+
 fn load_access_control(config: &ServerConfig) -> Result<AccessControlBootstrap, String> {
     let tenant_registry = config
         .tenant_config_path
@@ -570,6 +586,12 @@ fn load_access_control(config: &ServerConfig) -> Result<AccessControlBootstrap, 
         .map(tenant::TenantRegistry::load_from_path)
         .transpose()?
         .map(Arc::new);
+    if let Some(warning) = tenant_registry
+        .as_deref()
+        .and_then(|registry| tenant_auth_warning(config, registry))
+    {
+        eprintln!("{warning}");
+    }
     let rbac_registry = config
         .rbac_config_path
         .as_deref()
@@ -1658,6 +1680,26 @@ fn sanitize_path_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_auth_warning_flags_tenants_left_without_authentication() {
+        let acme_only = tenant::TenantRegistry::from_json_str(
+            r#"{"tenants": {"acme": {"auth": {"tokens": [{"token": "t", "scopes": ["read"]}]}}}}"#,
+        )
+        .unwrap();
+        let defaults_with_token = tenant::TenantRegistry::from_json_str(
+            r#"{"defaults": {"auth": {"tokens": [{"token": "t", "scopes": ["read"]}]}}}"#,
+        )
+        .unwrap();
+        let open = ServerConfig::default();
+        let with_global_token = ServerConfig {
+            auth_token: Some("global".to_string()),
+            ..ServerConfig::default()
+        };
+        assert!(tenant_auth_warning(&open, &acme_only).is_some());
+        assert!(tenant_auth_warning(&with_global_token, &acme_only).is_none());
+        assert!(tenant_auth_warning(&open, &defaults_with_token).is_none());
+    }
 
     #[test]
     fn cluster_bind_warning_flags_an_address_peers_cannot_use() {
