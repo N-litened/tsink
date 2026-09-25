@@ -283,10 +283,12 @@ fn combine_vector_samples(
     rhs: &Sample,
     result_on_rhs: bool,
 ) -> Result<Option<Sample>> {
-    let mut sample = if result_on_rhs {
-        rhs.clone()
+    // The result starts from the "many" side, which is the left-hand side
+    // unless the match is group_right.
+    let (mut sample, one_side) = if result_on_rhs {
+        (rhs.clone(), lhs)
     } else {
-        lhs.clone()
+        (lhs.clone(), rhs)
     };
 
     if expr.op.is_comparison() {
@@ -296,19 +298,32 @@ fn combine_vector_samples(
             sample.value = if matched { 1.0 } else { 0.0 };
         } else if !matched {
             return Ok(None);
-        } else if !result_on_rhs && expr.matching.as_ref().is_some_and(|m| m.on) {
-            sample.metric.clear();
+        } else {
+            // A filtering comparison keeps the left-hand value.
+            sample.value = lhs.value;
         }
     } else {
         sample.metric.clear();
         sample.value = arithmetic(expr.op, lhs.value, rhs.value)?;
     }
 
+    // Build the result labels the way Prometheus' resultMetric does.
     if let Some(matching) = expr.matching.as_ref() {
-        if result_on_rhs {
-            include_labels_from_one_side(&mut sample.labels, lhs, &matching.include_labels);
-        } else if matching.cardinality == VectorMatchCardinality::ManyToOne {
-            include_labels_from_one_side(&mut sample.labels, rhs, &matching.include_labels);
+        if matching.cardinality == VectorMatchCardinality::OneToOne {
+            let listed = |name: &str| matching.labels.iter().any(|label| label == name);
+            if matching.on {
+                sample.labels.retain(|label| listed(&label.name));
+                if !listed("__name__") {
+                    sample.metric.clear();
+                }
+            } else {
+                sample.labels.retain(|label| !listed(&label.name));
+                if listed("__name__") {
+                    sample.metric.clear();
+                }
+            }
+        } else {
+            include_labels_from_one_side(&mut sample.labels, one_side, &matching.include_labels);
         }
     }
 
@@ -411,13 +426,13 @@ fn matching_cardinality(matching: Option<&VectorMatching>) -> VectorMatchCardina
 
 fn include_labels_from_one_side(base: &mut Vec<Label>, source: &Sample, labels: &[String]) {
     for label_name in labels {
-        if let Some(value) = source
+        match source
             .labels
             .iter()
-            .find(|label| label.name == *label_name)
-            .map(|label| label.value.clone())
+            .find(|label| label.name == *label_name && !label.value.is_empty())
         {
-            set_label(base, label_name, &value);
+            Some(label) => set_label(base, label_name, &label.value),
+            None => base.retain(|label| label.name != *label_name),
         }
     }
 }

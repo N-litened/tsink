@@ -1256,24 +1256,18 @@ fn vector_matching_distinguishes_delimiter_collision_group_labels() {
             .unwrap(),
     );
 
+    // One-to-one on() keeps only the matching labels.
     samples.sort_by(|a, b| a.labels.cmp(&b.labels));
     assert_eq!(samples.len(), 2);
-    assert_eq!(samples[0].value, 12.0);
+    assert_eq!(samples[0].value, 24.0);
     assert_eq!(
         samples[0].labels,
-        vec![
-            Label::new("instance", "a"),
-            Label::new("job", format!("api{delimiter}zone=west")),
-        ]
+        vec![Label::new("job", "api"), Label::new("zone", "west")]
     );
-    assert_eq!(samples[1].value, 24.0);
+    assert_eq!(samples[1].value, 12.0);
     assert_eq!(
         samples[1].labels,
-        vec![
-            Label::new("instance", "b"),
-            Label::new("job", "api"),
-            Label::new("zone", "west"),
-        ]
+        vec![Label::new("job", format!("api{delimiter}zone=west"))]
     );
 }
 
@@ -2168,4 +2162,59 @@ fn metric_name_behaves_as_the_name_label() {
         .labels
         .iter()
         .all(|label| label.name != "__name__"));
+}
+
+#[test]
+fn vector_matching_builds_prometheus_result_labels() {
+    let storage = StorageBuilder::new()
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .build()
+        .unwrap();
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "left",
+                vec![
+                    Label::new("extra", "x"),
+                    Label::new("instance", "1"),
+                    Label::new("job", "a"),
+                ],
+                DataPoint::new(60, 10.0),
+            ),
+            Row::with_labels(
+                "right",
+                vec![Label::new("instance", "2"), Label::new("job", "a")],
+                DataPoint::new(60, 3.0),
+            ),
+            Row::with_labels(
+                "many",
+                vec![Label::new("env", "old"), Label::new("job", "a")],
+                DataPoint::new(60, 2.0),
+            ),
+        ])
+        .unwrap();
+    let engine = Engine::with_precision(storage, TimestampPrecision::Seconds);
+    let query = |q: &str| as_instant_vector(engine.instant_query(q, 60).unwrap());
+
+    let on = query("left + on(job) right");
+    assert_eq!(on.len(), 1);
+    assert_eq!(on[0].labels, vec![Label::new("job", "a")]);
+    assert_eq!(on[0].value, 13.0);
+
+    let ignoring = query("left + ignoring(instance, extra) right");
+    assert_eq!(ignoring.len(), 1);
+    assert_eq!(ignoring[0].labels, vec![Label::new("job", "a")]);
+
+    let group_right = query("left > on(job) group_right right");
+    assert_eq!(group_right.len(), 1);
+    assert_eq!(group_right[0].metric, "right");
+    assert_eq!(
+        group_right[0].labels,
+        vec![Label::new("instance", "2"), Label::new("job", "a")]
+    );
+    assert_eq!(group_right[0].value, 10.0);
+
+    let group_left = query("many * on(job) group_left(env) right");
+    assert_eq!(group_left.len(), 1);
+    assert_eq!(group_left[0].labels, vec![Label::new("job", "a")]);
 }
