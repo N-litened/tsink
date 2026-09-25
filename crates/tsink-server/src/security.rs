@@ -1447,6 +1447,11 @@ fn sanitize_provided_token(value: &str) -> Result<String, String> {
     if token.is_empty() {
         return Err("newValue must not be empty".to_string());
     }
+    // A secret file whose text starts with '{' is read as an exec manifest, so a rotated
+    // value must not be able to turn a token file into a command.
+    if token.starts_with('{') {
+        return Err("newValue must not start with '{'".to_string());
+    }
     Ok(token.to_string())
 }
 
@@ -1560,6 +1565,34 @@ mod tests {
             fs::read_to_string(secret_path).expect("secret file should read"),
             "token-b"
         );
+    }
+
+    #[test]
+    fn rotating_a_file_backed_secret_cannot_install_an_exec_manifest() {
+        let temp_dir = TempDir::new().expect("temp dir should exist");
+        let secret_path = temp_dir.path().join("public.token");
+        let marker_path = temp_dir.path().join("executed");
+        fs::write(&secret_path, "token-a\n").expect("secret should write");
+        let secret = ManagedStringSecret::from_path(
+            SecretRotationTarget::PublicAuthToken,
+            secret_path.clone(),
+            true,
+            true,
+        )
+        .expect("secret should open");
+
+        let manifest = serde_json::json!({
+            "kind": "exec",
+            "command": ["/bin/sh", "-c", format!("touch {}", marker_path.display())],
+        })
+        .to_string();
+        assert!(secret.rotate(Some(manifest), None).is_err());
+        assert_eq!(
+            fs::read_to_string(&secret_path).expect("secret file should read"),
+            "token-a\n"
+        );
+        assert!(secret.matches(Some("token-a")));
+        assert!(!marker_path.exists());
     }
 
     #[cfg(unix)]
