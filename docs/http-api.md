@@ -454,11 +454,11 @@ OTLP HTTP metrics ingest. Accepts protobuf-encoded `ExportMetricsServiceRequest`
 |---|---|
 | `Content-Type` | `application/x-protobuf` or `application/protobuf` |
 
-Supported metric kinds: gauges, monotonic sums, histograms, summaries, and exponential histograms. Exemplars within OTLP payloads are forwarded to the exemplar store.
+Supported metric kinds: gauges, sums, explicit-bucket histograms, and summaries. Sums and histograms must use cumulative temporality. Exponential histograms, delta temporality, and data points flagged `NO_RECORDED_VALUE` are rejected with `400`. Exemplars within OTLP payloads are forwarded to the exemplar store.
 
 Feature flag: `TSINK_OTLP_METRICS_ENABLED` (default `true`).
 
-**Response:** `200 application/json` — OTLP `ExportMetricsServiceResponse` JSON.
+**Response:** `200 application/x-protobuf` — protobuf OTLP `ExportMetricsServiceResponse`.
 
 **Error codes:** `415` unsupported content type, `422` OTLP ingest disabled.
 

@@ -178,14 +178,16 @@ Admission control, rules evaluation, and edge sync behaviour are tuned through e
 
 ### Remote write feature flags
 
+[Configuration](configuration.md) is the reference for these variables and their defaults.
+
 | Variable | Default | Description |
 |---|---|---|
-| `TSINK_REMOTE_WRITE_METADATA_ENABLED` | `false` | Accept metric metadata in Prometheus remote write payloads. |
+| `TSINK_REMOTE_WRITE_METADATA_ENABLED` | `true` | Accept metric metadata in Prometheus remote write payloads. |
 | `TSINK_REMOTE_WRITE_MAX_METADATA_UPDATES` | `512` | Maximum metadata updates accepted per remote write request. |
-| `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `false` | Accept exemplars in Prometheus remote write payloads. |
-| `TSINK_REMOTE_WRITE_HISTOGRAMS_ENABLED` | `false` | Accept native histograms in Prometheus remote write payloads. |
+| `TSINK_REMOTE_WRITE_EXEMPLARS_ENABLED` | `true` | Accept exemplars in Prometheus remote write payloads. |
+| `TSINK_REMOTE_WRITE_HISTOGRAMS_ENABLED` | `true` | Accept native histograms in Prometheus remote write payloads. |
 | `TSINK_REMOTE_WRITE_MAX_HISTOGRAM_BUCKET_ENTRIES` | `16384` | Maximum bucket entries per histogram in a remote write payload. |
-| `TSINK_OTLP_METRICS_ENABLED` | `false` | Enable the OTLP `/v1/metrics` endpoint. |
+| `TSINK_OTLP_METRICS_ENABLED` | `true` | Enable the OTLP `/v1/metrics` endpoint. |
 
 ### Rules engine
 
@@ -251,7 +253,7 @@ All other endpoints require a valid `Authorization: Bearer <token>` header when 
 | `POST` | `/api/v1/import/prometheus` | Prometheus text exposition bulk import. |
 | `POST` | `/write` | InfluxDB line protocol (v1 path). |
 | `POST` | `/api/v2/write` | InfluxDB line protocol (v2 path). |
-| `POST` | `/v1/metrics` | OTLP HTTP/protobuf metrics. Requires `TSINK_OTLP_METRICS_ENABLED=true`. |
+| `POST` | `/v1/metrics` | OTLP HTTP/protobuf metrics. Disable with `TSINK_OTLP_METRICS_ENABLED=false`. |
 
 StatsD and Graphite use separate UDP/TCP listeners configured via `--statsd-listen` and `--graphite-listen`.
 

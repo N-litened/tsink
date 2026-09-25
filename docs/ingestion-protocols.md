@@ -155,7 +155,7 @@ Tag key-value pairs are stored as series labels.
 
 ### Precision
 
-The optional `precision` query parameter controls the timestamp unit. Accepted values: `ns`, `us`, `µs`, `ms`, `s`. If omitted, the server's configured `--timestamp-precision` value is assumed for incoming timestamps. Samples without a timestamp use the current server time.
+The optional `precision` query parameter controls the timestamp unit. Accepted values: `ns`, `u` or `us`, `ms`, `s`, `m`, and `h`. If omitted, timestamps are read as nanoseconds, as in InfluxDB, and converted to the server's `--timestamp-precision`; a client that sends milliseconds must pass `precision=ms`. Samples without a timestamp use the current server time.
 
 ```
 POST /write?precision=s
@@ -164,7 +164,7 @@ POST /api/v2/write?precision=ms
 
 ### Labels from query parameters
 
-Additional labels can be injected via query string parameters prefixed with `db=` (preserved for InfluxDB compatibility) or any other recognized label-key parameter. In practice tsink passes all non-precision, non-bucket query parameters through as extra labels on all resulting series.
+The `db`, `rp`, `bucket`, and `org` query parameters, when set, are added to every resulting series as the `influx_db`, `influx_rp`, `influx_bucket`, and `influx_org` labels. Other query parameters are ignored.
 
 ### Limits
 
@@ -172,7 +172,7 @@ Additional labels can be injected via query string parameters prefixed with `db=
 |---|---|---|
 | `TSINK_INFLUX_LINE_PROTOCOL_MAX_LINES_PER_REQUEST` | `4096` | Maximum lines per HTTP request |
 
-Requests exceeding the line limit are rejected with `400`.
+Requests exceeding the line limit are rejected with `413`.
 
 ### Example
 
@@ -202,8 +202,9 @@ Must be `application/x-protobuf` or `application/protobuf`. Other content types 
 | OTLP shape | Stored as |
 |---|---|
 | `Gauge` | `gauge` series (float64 samples) |
-| `Sum` (monotonic) | `counter` series |
-| `Sum` (non-monotonic) | `gauge` series |
+| `Sum` (monotonic, cumulative) | `counter` series |
+| `Sum` (non-monotonic, cumulative) | `gauge` series |
+| `Sum` or `Histogram` with delta temporality | **Not supported** — rejected with `400` |
 | `Histogram` (explicit buckets, cumulative) | Flat bucket series with `le` label per boundary |
 | `Summary` | Quantile series with `quantile` label |
 | `ExponentialHistogram` | **Not supported** — requests containing these are rejected with `400` |
@@ -217,7 +218,11 @@ Must be `application/x-protobuf` or `application/protobuf`. Other content types 
 
 ### Timestamps
 
-OTLP uses nanosecond Unix timestamps. tsink converts them to the server's configured `--timestamp-precision` before storage. Data points with the `NO_RECORDED_VALUE` flag set are skipped.
+OTLP uses nanosecond Unix timestamps. tsink converts them to the server's configured `--timestamp-precision` before storage. Data points with the `NO_RECORDED_VALUE` flag set are not supported; a request containing one is rejected with `400`.
+
+### Response
+
+On success the endpoint returns `200` with a protobuf `ExportMetricsServiceResponse` body (`Content-Type: application/x-protobuf`).
 
 ### Example
 
@@ -375,4 +380,4 @@ All ingest paths are subject to global and per-tenant admission control:
 - **Global write admission** — controls the maximum number of in-flight write requests and total in-flight row count. Configurable via environment variables; tuned at startup.
 - **Tenant quotas** — maximum rows per request per tenant, maximum in-flight write requests and units per tenant, configurable in the tenant config JSON.
 
-Requests rejected by admission return `413` with a plain-text error body.
+Requests rejected because the in-flight request or row budget is momentarily full return `429` with `Retry-After: 1`; retry them. Requests that can never fit (for example, more rows than a hard per-request limit) return `413`. Both have a plain-text error body. See [Configuration](configuration.md) for the environment variables and their defaults.
