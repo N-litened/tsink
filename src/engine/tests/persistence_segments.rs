@@ -389,6 +389,93 @@ fn persist_segment_stamps_wal_highwater_when_wal_is_enabled() {
 }
 
 #[test]
+fn flush_keeps_the_wal_for_a_write_that_lands_between_snapshot_passes() {
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "a")];
+    let wal = FramedWal::open(temp_dir.path().join(WAL_DIR_NAME), WalSyncMode::PerAppend).unwrap();
+    let storage = Arc::new(
+        ChunkStorage::new_with_data_path_and_options(
+            8,
+            Some(wal),
+            Some(temp_dir.path().join(NUMERIC_LANE_ROOT)),
+            None,
+            1,
+            ChunkStorageOptions {
+                timestamp_precision: TimestampPrecision::Seconds,
+                retention_enforced: false,
+                background_threads_enabled: false,
+                ..ChunkStorageOptions::default()
+            },
+        )
+        .unwrap(),
+    );
+    storage
+        .insert_rows(&[Row::with_labels(
+            "split_write",
+            labels.clone(),
+            DataPoint::new(0, 0.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+
+    // One acknowledged write fills a chunk and leaves a tail in the active head
+    // after the flush has scanned the active heads but before it scans sealed chunks.
+    storage.set_flush_snapshot_between_passes_hook({
+        let storage = Arc::downgrade(&storage);
+        let labels = labels.clone();
+        move || {
+            let Some(storage) = storage.upgrade() else {
+                return;
+            };
+            let rows = (1..=10)
+                .map(|ts| {
+                    Row::with_labels("split_write", labels.clone(), DataPoint::new(ts, ts as f64))
+                })
+                .collect::<Vec<_>>();
+            std::thread::spawn(move || storage.insert_rows(&rows).unwrap())
+                .join()
+                .unwrap();
+        }
+    });
+    storage.persist_segment().unwrap();
+    storage.clear_flush_snapshot_between_passes_hook();
+
+    let wal = storage.persisted.wal.as_ref().unwrap();
+    let persisted_highwater = storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .values()
+        .map(|segment| segment.manifest.wal_highwater)
+        .max()
+        .unwrap();
+    assert!(
+        persisted_highwater < wal.current_appended_highwater(),
+        "the segment must not cover a write whose tail is only in memory"
+    );
+
+    // Crash without closing, then recover from the segments and the WAL.
+    std::mem::forget(storage);
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(8)
+        .build()
+        .unwrap();
+    assert_eq!(
+        reopened
+            .select("split_write", &labels, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|point| point.timestamp)
+            .collect::<Vec<_>>(),
+        (0..=10).collect::<Vec<_>>()
+    );
+    reopened.close().unwrap();
+}
+
+#[test]
 fn close_reconciles_compacted_segments_before_checkpointing_registry() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join("lane_numeric");

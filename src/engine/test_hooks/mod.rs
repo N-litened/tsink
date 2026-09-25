@@ -14,6 +14,7 @@ pub(super) type IngestCommitHook = dyn Fn() + Send + Sync + 'static;
 pub(super) struct PersistTestHooks {
     pub(super) post_publish_hook: RwLock<Option<Arc<PersistPostPublishHook>>>,
     pub(super) pre_flush_visibility_publish_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    pub(super) flush_snapshot_between_passes_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) post_series_definitions_append_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) post_samples_append_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) pre_sealed_chunk_publish_hook: RwLock<Option<Arc<IngestCommitHook>>>,

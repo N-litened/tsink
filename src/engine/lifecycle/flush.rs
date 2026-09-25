@@ -82,8 +82,14 @@ impl ChunkStorage {
     }
 
     fn collect_flush_persist_snapshot(
+        &self,
         snapshot_ctx: FlushSnapshotContext<'_>,
     ) -> Result<FlushPersistSnapshot> {
+        // A write publishes its WAL highwater only after all of its points are in memory, so
+        // every frame at or below this value is fully visible to both passes below. A write
+        // that lands between the passes can seal a chunk the sealed pass sees while the rest
+        // of it stays in an active head the first pass already scanned.
+        let applied_wal_highwater = snapshot_ctx.wal.map(|wal| wal.current_appended_highwater());
         let persisted = snapshot_ctx.persisted_chunk_watermarks.read();
         let active_wal_floor = snapshot_ctx.wal.and_then(|_| {
             snapshot_ctx
@@ -101,6 +107,18 @@ impl ChunkStorage {
         });
         let mut snapshot = FlushPersistSnapshot::default();
         let mut max_chunk_wal_highwater = WalHighWatermark::default();
+
+        #[cfg(test)]
+        {
+            let hook = self
+                .persist_test_hooks
+                .flush_snapshot_between_passes_hook
+                .read()
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
 
         for shard in snapshot_ctx.chunks.sealed_chunks {
             let sealed = shard.read();
@@ -159,6 +177,9 @@ impl ChunkStorage {
             .map_or(max_chunk_wal_highwater, |floor| {
                 max_chunk_wal_highwater.min(floor)
             });
+        if let Some(applied_wal_highwater) = applied_wal_highwater {
+            snapshot.wal_highwater = snapshot.wal_highwater.min(applied_wal_highwater);
+        }
 
         Ok(snapshot)
     }
@@ -182,6 +203,25 @@ impl ChunkStorage {
     #[cfg(test)]
     pub(in super::super) fn clear_persist_post_publish_hook(&self) {
         *self.persist_test_hooks.post_publish_hook.write() = None;
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn set_flush_snapshot_between_passes_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .flush_snapshot_between_passes_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn clear_flush_snapshot_between_passes_hook(&self) {
+        *self
+            .persist_test_hooks
+            .flush_snapshot_between_passes_hook
+            .write() = None;
     }
 
     #[cfg(test)]
@@ -238,7 +278,7 @@ impl ChunkStorage {
             return Ok(None);
         }
 
-        let flush_snapshot = Self::collect_flush_persist_snapshot(snapshot_ctx)?;
+        let flush_snapshot = self.collect_flush_persist_snapshot(snapshot_ctx)?;
         if flush_snapshot.is_empty() {
             return Ok(None);
         }
