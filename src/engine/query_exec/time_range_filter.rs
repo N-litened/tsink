@@ -16,6 +16,18 @@ enum SeriesVisibilitySummaryDecision {
     NeedsExactScan,
 }
 
+/// The exact scans below search `(start - 1, end - 1]`, which cannot express a
+/// query that starts at `i64::MIN`; a chunk that starts there is checked here.
+fn start_is_visible_minimum(
+    start: i64,
+    chunk_min_ts: i64,
+    tombstone_ranges: Option<&[tombstone::TombstoneRange]>,
+) -> bool {
+    start == i64::MIN
+        && chunk_min_ts == i64::MIN
+        && ChunkStorage::timestamp_survives_tombstones(i64::MIN, tombstone_ranges)
+}
+
 impl TimeRangeFilterContext<'_> {
     fn series_visibility_summary_decision_for_time_range(
         summary: &SeriesVisibilitySummary,
@@ -77,6 +89,9 @@ impl TimeRangeFilterContext<'_> {
                 return Ok(false);
             }
         }
+        if start_is_visible_minimum(start, chunk.header.min_ts, tombstone_ranges) {
+            return Ok(true);
+        }
 
         Ok(ChunkStorage::latest_visible_timestamp_in_chunk(
             chunk,
@@ -110,6 +125,9 @@ impl TimeRangeFilterContext<'_> {
             ) {
                 return Ok(false);
             }
+        }
+        if start_is_visible_minimum(start, chunk_ref.min_ts, tombstone_ranges) {
+            return Ok(true);
         }
 
         Ok(self
@@ -342,5 +360,62 @@ impl ChunkStorage {
             )?
             .iter()
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::chunk::{ChunkHeader, ChunkPoint, ValueLane};
+    use crate::engine::encoder::Encoder;
+    use crate::engine::segment::WalHighWatermark;
+    use crate::engine::series::SeriesValueFamily;
+    use crate::Value;
+
+    fn chunk(timestamps: &[i64]) -> Chunk {
+        let points = timestamps
+            .iter()
+            .map(|&ts| ChunkPoint {
+                ts,
+                value: Value::F64(1.0),
+            })
+            .collect::<Vec<_>>();
+        let encoded = Encoder::encode_chunk_points(&points, ValueLane::Numeric).unwrap();
+        Chunk {
+            header: ChunkHeader {
+                series_id: 1,
+                lane: ValueLane::Numeric,
+                value_family: Some(SeriesValueFamily::F64),
+                point_count: points.len() as u16,
+                min_ts: timestamps[0],
+                max_ts: *timestamps.last().unwrap(),
+                ts_codec: encoded.ts_codec,
+                value_codec: encoded.value_codec,
+            },
+            points,
+            encoded_payload: encoded.payload,
+            wal_highwater: WalHighWatermark::default(),
+        }
+    }
+
+    #[test]
+    fn chunk_scan_includes_a_point_at_i64_min() {
+        // The chunk extends past the range, so it needs an exact scan.
+        let chunk = chunk(&[i64::MIN, i64::MIN + 500]);
+        let visible = |tombstones: Option<&[tombstone::TombstoneRange]>| {
+            TimeRangeFilterContext::chunk_has_visible_timestamp_in_time_range(
+                &chunk,
+                i64::MIN,
+                i64::MIN + 100,
+                tombstones,
+            )
+            .unwrap()
+        };
+        assert!(visible(None));
+        let deleted = [tombstone::TombstoneRange {
+            start: i64::MIN,
+            end: i64::MIN + 1,
+        }];
+        assert!(!visible(Some(&deleted)));
     }
 }
