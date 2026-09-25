@@ -96,10 +96,13 @@ impl SeriesRegistry {
     }
 
     pub fn persist_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let bytes = self.encode_registry_snapshot()?;
+        Self::write_registry_snapshot(path, &bytes)
+    }
 
+    /// Encodes the registry into an uncompressed snapshot. The dictionary locks are
+    /// held only while copying, not while the snapshot is compressed and written.
+    pub(crate) fn encode_registry_snapshot(&self) -> Result<Vec<u8>> {
         let metric_dict = self.metric_dict.read();
         let label_name_dict = self.label_name_dict.read();
         let label_value_dict = self.label_value_dict.read();
@@ -144,9 +147,15 @@ impl SeriesRegistry {
             }
         }
 
-        let bytes = encode_optional_zstd_framed_file(&bytes)?;
-        write_file_atomically_and_sync_parent(path, &bytes)?;
-        Ok(())
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_registry_snapshot(path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let bytes = encode_optional_zstd_framed_file(bytes)?;
+        write_file_atomically_and_sync_parent(path, &bytes)
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self> {

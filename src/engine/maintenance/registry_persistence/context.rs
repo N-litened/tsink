@@ -116,7 +116,9 @@ impl<'a> RegistryPersistenceContext<'a> {
     }
 
     fn persist_registry_snapshot(self, checkpoint_path: &Path) -> Result<()> {
-        self.registry.read().persist_to_path(checkpoint_path)
+        // Release the registry and its dictionaries before compressing and syncing.
+        let bytes = self.registry.read().encode_registry_snapshot()?;
+        SeriesRegistry::write_registry_snapshot(checkpoint_path, &bytes)
     }
 
     fn delta_series_count_value(self) -> u64 {
@@ -139,10 +141,12 @@ impl<'a> RegistryPersistenceContext<'a> {
     where
         PersistCatalog: Fn(&Path) -> Result<()>,
     {
+        // Series created while the snapshot is written stay pending for the next delta.
+        let pending_series_ids = self.pending_series_ids_snapshot();
         self.persist_registry_snapshot(checkpoint_path)?;
         crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(delta_path)?;
         crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(delta_dir_path)?;
-        self.clear_pending_series_ids();
+        self.remove_pending_series_ids(pending_series_ids);
         self.set_delta_series_count(0);
         if let Err(err) = persist_catalog_index(checkpoint_path) {
             if allow_invalid_catalog && segment_validation_error_message(&err).is_some() {
