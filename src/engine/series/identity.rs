@@ -445,6 +445,9 @@ impl SeriesRegistry {
             label_pairs: label_pairs.clone(),
         };
         let shard_idx = Self::key_shard_idx_for_key(&key);
+        // Look the id up before taking the key shard: the id may be bound in this same
+        // shard, and the shard locks are not reentrant.
+        let existing_by_id = self.get_by_id(series_id);
         let mut shard = self.series_shards[shard_idx].write();
 
         if let Some(existing_id) = shard.by_key.get(&key) {
@@ -462,7 +465,7 @@ impl SeriesRegistry {
             });
         }
 
-        if let Some(existing) = self.get_by_id(series_id) {
+        if let Some(existing) = existing_by_id.or_else(|| shard.by_id.get(&series_id).cloned()) {
             if existing.metric_id != metric_id || existing.label_pairs != label_pairs {
                 return Err(TsinkError::DataCorruption(format!(
                     "series id {} already exists with a different series definition",

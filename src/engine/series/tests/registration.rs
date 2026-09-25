@@ -195,3 +195,49 @@ fn rejects_invalid_input() {
     let oversized_err = registry.resolve_or_insert("m", &[oversized]).unwrap_err();
     assert!(matches!(oversized_err, TsinkError::InvalidLabel(_)));
 }
+
+#[test]
+fn registering_a_known_id_under_another_key_in_the_same_shard_reports_corruption() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // Registry shards are chosen from interned ids, so intern `pad_count` other
+    // values first to find a cpu{host="b"} key in the same shard as cpu{host="a"}.
+    let prepare = |registry: &SeriesRegistry, pad_count: usize| {
+        registry
+            .register_series_with_id(42, "cpu", &[Label::new("host", "a")])
+            .unwrap();
+        for pad in 0..pad_count {
+            registry
+                .resolve_or_insert("pad", &[Label::new("pad", format!("v{pad}"))])
+                .unwrap();
+        }
+    };
+    let pad_count = (0..10_000)
+        .find(|&pad_count| {
+            let probe = SeriesRegistry::new();
+            prepare(&probe, pad_count);
+            let colliding = probe
+                .resolve_or_insert("cpu", &[Label::new("host", "b")])
+                .unwrap()
+                .series_id;
+            probe.load_series_registry_shard_idx(colliding)
+                == probe.load_series_registry_shard_idx(42)
+        })
+        .unwrap();
+
+    let registry = std::sync::Arc::new(SeriesRegistry::new());
+    prepare(&registry, pad_count);
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn({
+        let registry = std::sync::Arc::clone(&registry);
+        move || {
+            let _ =
+                tx.send(registry.register_series_with_id(42, "cpu", &[Label::new("host", "b")]));
+        }
+    });
+    let result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("registration must not deadlock");
+    assert!(matches!(result, Err(TsinkError::DataCorruption(_))));
+}
