@@ -3059,6 +3059,53 @@ fn select_series_time_range_stays_decode_free_across_many_series_and_segments() 
 }
 
 #[test]
+fn time_bounded_selection_and_delete_see_points_in_later_segments() {
+    let temp_dir = TempDir::new().unwrap();
+    let labels = vec![Label::new("host", "split")];
+    let storage = persistent_numeric_storage(temp_dir.path(), TimestampPrecision::Seconds, 8);
+    // The first segment's chunk spans the query range without a point inside it.
+    storage
+        .insert_rows(&[
+            Row::with_labels("cpu", labels.clone(), DataPoint::new(0, 1.0)),
+            Row::with_labels("cpu", labels.clone(), DataPoint::new(1000, 2.0)),
+        ])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+    storage
+        .insert_rows(&[Row::with_labels(
+            "cpu",
+            labels.clone(),
+            DataPoint::new(150, 3.0),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+
+    let in_range = SeriesSelection::new()
+        .with_metric("cpu")
+        .with_time_range(100, 200);
+    assert_eq!(
+        storage.select_series(&in_range).unwrap(),
+        vec![MetricSeries {
+            name: "cpu".to_string(),
+            labels: labels.clone(),
+        }],
+    );
+    assert_eq!(storage.delete_series(&in_range).unwrap().matched_series, 1);
+    assert_eq!(
+        storage
+            .select("cpu", &labels, 0, 2000)
+            .unwrap()
+            .into_iter()
+            .map(|point| point.timestamp)
+            .collect::<Vec<_>>(),
+        vec![0, 1000],
+    );
+    storage.close().unwrap();
+}
+
+#[test]
 fn select_series_time_range_uses_timestamp_search_index_for_partial_persisted_overlap() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

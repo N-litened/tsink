@@ -13,10 +13,6 @@ pub(super) struct PersistedTimeRangePruneResult {
     pub(super) exact_scan_chunk_refs: HashMap<SeriesId, Vec<PersistedChunkRef>>,
 }
 
-fn bitmap_cardinality(bitmap: &RoaringTreemap) -> usize {
-    usize::try_from(bitmap.len()).unwrap_or(usize::MAX)
-}
-
 fn persisted_segment_overlaps_time_range(
     segment: &PersistedSegmentState,
     start: i64,
@@ -85,8 +81,9 @@ pub(super) fn prune_persisted_exact_scan_candidates<'a>(
         return PersistedTimeRangePruneResult::default();
     }
 
+    // Every overlapping segment is visited: a chunk whose bounds overlap the
+    // range may still have no visible point inside it.
     let mut result = PersistedTimeRangePruneResult::default();
-    let candidate_count = bitmap_cardinality(series_ids);
     for segment in segments {
         if !persisted_segment_overlaps_time_range(segment, start, end, plan) {
             continue;
@@ -116,9 +113,6 @@ pub(super) fn prune_persisted_exact_scan_candidates<'a>(
         }
 
         result.overlapping_series_ids |= overlapping_series_in_segment;
-        if result.exact_scan_chunk_refs.len() >= candidate_count {
-            break;
-        }
     }
 
     result
@@ -228,6 +222,43 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![series_id],
+        );
+    }
+
+    #[test]
+    fn prune_collects_overlapping_chunks_from_every_segment() {
+        let series_id = 7;
+        let wide = segment(
+            1,
+            PersistedSegmentTier::Hot,
+            0,
+            1000,
+            HashMap::from([(series_id, vec![chunk_ref(1, 0, 1000)])]),
+            None,
+        );
+        let inside = segment(
+            2,
+            PersistedSegmentTier::Hot,
+            150,
+            150,
+            HashMap::from([(series_id, vec![chunk_ref(2, 150, 150)])]),
+            None,
+        );
+
+        let result = prune_persisted_exact_scan_candidates(
+            [&wide, &inside],
+            &bitmap(&[series_id]),
+            100,
+            200,
+            TieredQueryPlan::from_cutoffs(100, 200, None, None),
+        );
+
+        assert_eq!(
+            result.exact_scan_chunk_refs[&series_id]
+                .iter()
+                .map(|chunk| (chunk.min_ts, chunk.max_ts))
+                .collect::<Vec<_>>(),
+            vec![(0, 1000), (150, 150)],
         );
     }
 
