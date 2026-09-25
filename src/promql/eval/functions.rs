@@ -13,7 +13,7 @@ use crate::promql::types::{
 };
 
 use super::time::duration_to_units;
-use super::{resolve_at_modifier, selector::matchers_match, Engine, QueryParams};
+use super::{resolve_at_modifier, selector::CompiledMatchers, Engine, QueryParams};
 
 pub(crate) fn eval_call(
     engine: &Engine,
@@ -1841,12 +1841,13 @@ fn load_info_series(
     let metrics = candidate_info_metrics(engine, &metric_matchers)?;
     let mut selected: BTreeMap<(String, String, String), InfoSeries> = BTreeMap::new();
 
+    let matchers = CompiledMatchers::new(matchers)?;
     for metric in metrics {
         for (labels, points) in engine.storage().select_all(&metric, start, end)? {
             let Some(point) = latest_point_for_info(points, start, end) else {
                 continue;
             };
-            if !matchers_match(&metric, &labels, matchers)? {
+            if !matchers.matches(&metric, &labels) {
                 continue;
             }
 
@@ -1918,9 +1919,10 @@ fn candidate_info_metrics(
         .collect::<Vec<_>>();
     metrics.sort();
     metrics.dedup();
+    let metric_matchers = CompiledMatchers::new(metric_matchers)?;
     let mut out = Vec::new();
     for metric in metrics {
-        if matchers_match(&metric, &[], metric_matchers)? {
+        if metric_matchers.matches(&metric, &[]) {
             out.push(metric);
         }
     }

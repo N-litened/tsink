@@ -146,9 +146,10 @@ fn collect_instant_samples_for_metric(
     params: &QueryParams<'_>,
     out: &mut Vec<Sample>,
 ) -> Result<()> {
+    let matchers = CompiledMatchers::new(&selector.matchers)?;
     let all_series = fetch_metric_series(engine, metric, start, end, params)?;
     for (labels, points) in all_series {
-        if !matchers_match(metric, &labels, &selector.matchers)? {
+        if !matchers.matches(metric, &labels) {
             continue;
         }
         if let Some(point) = latest_instant_point(points, start, end) {
@@ -182,9 +183,10 @@ fn collect_range_series_for_metric(
     params: &QueryParams<'_>,
     out: &mut Vec<Series>,
 ) -> Result<()> {
+    let matchers = CompiledMatchers::new(&selector.vector.matchers)?;
     let all_series = fetch_metric_series(engine, metric, start, end, params)?;
     for (labels, points) in all_series {
-        if !matchers_match(metric, &labels, &selector.vector.matchers)? {
+        if !matchers.matches(metric, &labels) {
             continue;
         }
 
@@ -367,35 +369,48 @@ fn has_exact_series(engine: &Engine, metric: &str, labels: &[Label]) -> Result<b
     Ok(false)
 }
 
-pub(crate) fn matchers_match(
-    metric: &str,
-    labels: &[Label],
-    matchers: &[crate::promql::ast::LabelMatcher],
-) -> Result<bool> {
-    for matcher in matchers {
-        let actual = if matcher.name == "__name__" {
-            metric
-        } else {
-            labels
-                .iter()
-                .find(|label| label.name == matcher.name)
-                .map(|label| label.value.as_str())
-                .unwrap_or("")
-        };
+/// Label matchers with their regexes compiled once, for filtering many series.
+pub(crate) struct CompiledMatchers<'a> {
+    matchers: Vec<(&'a crate::promql::ast::LabelMatcher, Option<Regex>)>,
+}
 
-        let matched = match matcher.op {
-            MatchOp::Equal => actual == matcher.value,
-            MatchOp::NotEqual => actual != matcher.value,
-            MatchOp::RegexMatch => anchored_regex(&matcher.value)?.is_match(actual),
-            MatchOp::RegexNoMatch => !anchored_regex(&matcher.value)?.is_match(actual),
-        };
-
-        if !matched {
-            return Ok(false);
-        }
+impl<'a> CompiledMatchers<'a> {
+    pub(crate) fn new(matchers: &'a [crate::promql::ast::LabelMatcher]) -> Result<Self> {
+        let matchers = matchers
+            .iter()
+            .map(|matcher| {
+                let regex = match matcher.op {
+                    MatchOp::RegexMatch | MatchOp::RegexNoMatch => {
+                        Some(anchored_regex(&matcher.value)?)
+                    }
+                    MatchOp::Equal | MatchOp::NotEqual => None,
+                };
+                Ok((matcher, regex))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { matchers })
     }
 
-    Ok(true)
+    pub(crate) fn matches(&self, metric: &str, labels: &[Label]) -> bool {
+        self.matchers.iter().all(|(matcher, regex)| {
+            let actual = if matcher.name == "__name__" {
+                metric
+            } else {
+                labels
+                    .iter()
+                    .find(|label| label.name == matcher.name)
+                    .map(|label| label.value.as_str())
+                    .unwrap_or("")
+            };
+            let regex_matches = || regex.as_ref().is_some_and(|regex| regex.is_match(actual));
+            match matcher.op {
+                MatchOp::Equal => actual == matcher.value,
+                MatchOp::NotEqual => actual != matcher.value,
+                MatchOp::RegexMatch => regex_matches(),
+                MatchOp::RegexNoMatch => !regex_matches(),
+            }
+        })
+    }
 }
 
 fn anchored_regex(pattern: &str) -> Result<Regex> {
