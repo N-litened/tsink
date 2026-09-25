@@ -45,8 +45,6 @@ pub(crate) async fn handle_admin_support_bundle(
                     cluster_context,
                     edge_sync_context,
                     tenant_registry,
-                    rbac_registry,
-                    security_manager,
                     usage_accounting,
                     None,
                 )

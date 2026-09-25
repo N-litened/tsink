@@ -2068,8 +2068,6 @@ async fn handle_tsdb_status(
     cluster_context: Option<&ClusterRequestContext>,
     edge_sync_context: Option<&edge_sync::EdgeSyncRuntimeContext>,
     tenant_registry: Option<&tenant::TenantRegistry>,
-    rbac_registry: Option<&RbacRegistry>,
-    security_manager: Option<&SecurityManager>,
     usage_accounting: Option<&UsageAccounting>,
     managed_control_plane: Option<&ManagedControlPlane>,
 ) -> HttpResponse {
@@ -2942,8 +2940,7 @@ async fn handle_tsdb_status(
                                 "skewFactor": item.skew_factor
                             })
                         }).collect::<Vec<_>>()
-                    },
-                    "security": security_status_json(security_manager, rbac_registry)
+                    }
                 }
             }
         }),
@@ -16656,6 +16653,8 @@ mod tests {
 
         let body: JsonValue = serde_json::from_slice(&response.body).expect("valid JSON");
         assert_eq!(body["status"], "success");
+        // Secret state is only served by the admin API.
+        assert!(body["data"].get("security").is_none());
         assert!(body["data"]["seriesCount"].is_number());
         assert!(body["data"]["memoryUsedBytes"].is_number());
         assert!(body["data"]["memory"]["budgetedBytes"].is_number());

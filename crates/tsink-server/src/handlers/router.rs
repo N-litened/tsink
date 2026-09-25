@@ -267,8 +267,6 @@ pub(super) async fn route_request(
                 cluster_context,
                 edge_sync_context,
                 tenant_registry,
-                rbac_registry,
-                security_manager,
                 usage_accounting,
                 managed_control_plane,
             )
