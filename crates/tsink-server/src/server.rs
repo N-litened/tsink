@@ -583,10 +583,36 @@ fn load_access_control(config: &ServerConfig) -> Result<AccessControlBootstrap, 
     })
 }
 
+/// Internal RPC is served on the `--listen` socket, and peers dial `--cluster-bind`, so
+/// the two must name the same port and the bind host must be one peers can reach.
+fn cluster_bind_warning(config: &ServerConfig) -> Option<String> {
+    let bind = config.cluster.bind.as_deref()?.trim();
+    let (bind_host, bind_port) = bind.rsplit_once(':')?;
+    let (_, listen_port) = config.listen.trim().rsplit_once(':')?;
+    if bind_port != listen_port {
+        return Some(format!(
+            "warning: --cluster-bind {bind} uses port {bind_port}, but internal RPC is served on the --listen port {listen_port}; peers will dial a port this node does not serve unless it is forwarded"
+        ));
+    }
+    let bind_host = bind_host.trim_start_matches('[').trim_end_matches(']');
+    if matches!(bind_host, "0.0.0.0" | "::") {
+        return Some(format!(
+            "warning: --cluster-bind {bind} is advertised to peers, who cannot dial an unspecified address; use this node's reachable host name or IP"
+        ));
+    }
+    None
+}
+
 async fn bootstrap_cluster_runtime(config: &ServerConfig) -> Result<ClusterBootstrap, String> {
     let mut cluster_context = None;
     let mut internal_api = None;
     let mut auto_join_runtime = None;
+
+    if config.cluster.enabled {
+        if let Some(warning) = cluster_bind_warning(config) {
+            eprintln!("{warning}");
+        }
+    }
 
     if let Some(runtime) = cluster::ClusterRuntime::bootstrap(&config.cluster)? {
         let mut runtime = runtime;
@@ -1632,6 +1658,27 @@ fn sanitize_path_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_bind_warning_flags_an_address_peers_cannot_use() {
+        let config = |listen: &str, bind: &str| {
+            let mut config = ServerConfig {
+                listen: listen.to_string(),
+                ..ServerConfig::default()
+            };
+            config.cluster.bind = Some(bind.to_string());
+            config
+        };
+        assert!(cluster_bind_warning(&config("0.0.0.0:9201", "node-1:9201")).is_none());
+        assert!(cluster_bind_warning(&config("0.0.0.0:9201", "node-1:9211"))
+            .unwrap()
+            .contains("port"));
+        assert!(
+            cluster_bind_warning(&config("0.0.0.0:9201", "0.0.0.0:9201"))
+                .unwrap()
+                .contains("unspecified")
+        );
+    }
     use crate::prom_remote::{
         Label as PromLabel, LabelMatcher, MatcherType, Query as PromReadQuery,
         QueryResult as PromReadQueryResult, ReadRequest, ReadResponse, Sample as PromSample,

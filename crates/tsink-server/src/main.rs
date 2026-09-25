@@ -326,7 +326,7 @@ struct ServerCliArgs {
     #[arg(
         long = "cluster-bind",
         value_name = "HOST:PORT",
-        help = "Internal RPC bind/advertise endpoint"
+        help = "Address peers use to reach this node; internal RPC is served on the --listen socket, so use a reachable host with the --listen port"
     )]
     cluster_bind: Option<String>,
     #[arg(
