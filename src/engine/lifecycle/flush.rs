@@ -184,6 +184,37 @@ impl ChunkStorage {
         *self.persist_test_hooks.post_publish_hook.write() = None;
     }
 
+    #[cfg(test)]
+    fn invoke_pre_flush_visibility_publish_hook(&self) {
+        let hook = self
+            .persist_test_hooks
+            .pre_flush_visibility_publish_hook
+            .read()
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn set_pre_flush_visibility_publish_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self
+            .persist_test_hooks
+            .pre_flush_visibility_publish_hook
+            .write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn clear_pre_flush_visibility_publish_hook(&self) {
+        *self
+            .persist_test_hooks
+            .pre_flush_visibility_publish_hook
+            .write() = None;
+    }
+
     fn write_flush_segment_stage(
         snapshot_ctx: FlushSnapshotContext<'_>,
         registry: &SeriesRegistry,
@@ -236,7 +267,8 @@ impl ChunkStorage {
 
         // Compaction picks its sources by scanning the segment directories, so it would merge
         // and delete a new root that a failure here or in verification or recovery metadata
-        // persistence still has to roll back. The caller holds the gate until then.
+        // persistence still has to roll back, or that is not yet in the visible catalog. The
+        // caller holds the gate until the new roots are published.
         let compaction_guard = self.compaction_gate();
         let published_segment_roots = {
             let registry = snapshot_ctx.registry.read();
@@ -536,11 +568,13 @@ impl ChunkStorage {
                 publish_ctx,
                 &verified_flush.published_segment_roots,
             )?;
-            drop(compaction_guard);
 
             if let Some(wal) = snapshot_ctx.wal {
                 wal.mark_durable_through(verified_flush.wal_highwater);
             }
+
+            #[cfg(test)]
+            self.invoke_pre_flush_visibility_publish_hook();
 
             let planned_dirty_refresh = self.plan_flush_dirty_refresh_stage(publish_ctx);
             let (wal_highwater, outcome) = self.publish_verified_flush_visibility_stage(
@@ -548,6 +582,11 @@ impl ChunkStorage {
                 verified_flush,
                 planned_dirty_refresh,
             )?;
+            // Compaction picks its sources from the segment directories, not the visible
+            // catalog, so it must not take the new roots until they are published. Otherwise
+            // it could delete them and a catalog refresh could run before this flush installs
+            // the already-deleted roots.
+            drop(compaction_guard);
             self.reset_flush_wal_stage(snapshot_ctx, wal_highwater)?;
             Ok(outcome)
         })();

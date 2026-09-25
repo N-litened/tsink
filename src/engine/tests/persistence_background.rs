@@ -3870,3 +3870,111 @@ fn compaction_waits_until_a_flushed_segment_persists_its_recovery_metadata() {
     );
     storage.close().unwrap();
 }
+
+#[test]
+fn compaction_waits_until_a_flushed_segment_is_published() {
+    use std::sync::Mutex;
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = Arc::new(persistent_numeric_storage(
+        temp_dir.path(),
+        TimestampPrecision::Milliseconds,
+        8,
+    ));
+    let labels = vec![Label::new("host", "a")];
+    let rows = |points: &[(i64, f64)]| {
+        points
+            .iter()
+            .map(|&(ts, value)| {
+                Row::with_labels("cpu_usage", labels.clone(), DataPoint::new(ts, value))
+            })
+            .collect::<Vec<_>>()
+    };
+    storage
+        .insert_rows(&rows(&[(0, 1.0), (1_000, 3.0), (2_000, 5.0)]))
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage
+        .insert_rows(&rows(&[(500, 2.0), (1_500, 4.0)]))
+        .unwrap();
+
+    // Between recovery metadata persistence and publication, run a compaction
+    // pass followed by the catalog refresh the background thread would apply.
+    let (compacted_tx, compacted_rx) = mpsc::channel();
+    let compacted_rx = Mutex::new(compacted_rx);
+    let compaction = Arc::new(Mutex::new(None));
+    storage.set_pre_flush_visibility_publish_hook({
+        let storage = Arc::downgrade(&storage);
+        let compaction = Arc::clone(&compaction);
+        move || {
+            let Some(storage) = storage.upgrade() else {
+                return;
+            };
+            let compacted_tx = compacted_tx.clone();
+            *compaction.lock().unwrap() = Some(std::thread::spawn(move || {
+                let compaction_guard = storage.compaction_gate();
+                let changes = ChunkStorage::compact_compactors_with_changes(
+                    storage.persisted.numeric_compactor.as_ref(),
+                    None,
+                    None,
+                )
+                .unwrap();
+                drop(compaction_guard);
+                storage
+                    .persisted
+                    .pending_persisted_segment_diff
+                    .lock()
+                    .merge(changes);
+                storage
+                    .persisted
+                    .persisted_index_dirty
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                storage
+                    .apply_known_dirty_persisted_refresh_if_pending()
+                    .unwrap();
+                let _ = compacted_tx.send(());
+            }));
+            let _ = compacted_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(300));
+        }
+    });
+
+    storage.flush_pipeline_once().unwrap();
+    storage.clear_pre_flush_visibility_publish_hook();
+    compaction
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the flush should have written a segment")
+        .join()
+        .unwrap();
+
+    for root in storage
+        .persisted
+        .persisted_index
+        .read()
+        .segments_by_root
+        .keys()
+    {
+        assert!(root.exists(), "visible segment {root:?} was deleted");
+    }
+    let points = storage.select("cpu_usage", &labels, 0, 10_000).unwrap();
+    assert_eq!(
+        points
+            .iter()
+            .map(|point| (point.timestamp, point.value_as_f64().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, 1.0),
+            (500, 2.0),
+            (1_000, 3.0),
+            (1_500, 4.0),
+            (2_000, 5.0)
+        ]
+    );
+    storage.insert_rows(&rows(&[(3_000, 6.0)])).unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage.close().unwrap();
+}
