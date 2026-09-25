@@ -887,6 +887,9 @@ pub fn edge_sync_dir(base_data_path: &Path) -> PathBuf {
     base_data_path.join(EDGE_SYNC_DIR_NAME)
 }
 
+/// Edge sources only replay rows, so the edge token authorizes nothing else.
+const EDGE_SYNC_ACCEPT_ENDPOINTS: &[&str] = &["/internal/v1/ingest_rows"];
+
 pub fn edge_sync_accept_internal_api(auth_token: &str) -> InternalApiConfig {
     InternalApiConfig::new(
         auth_token.to_string(),
@@ -895,6 +898,7 @@ pub fn edge_sync_accept_internal_api(auth_token: &str) -> InternalApiConfig {
         Vec::new(),
     )
     .with_compatibility(CompatibilityProfile::default())
+    .restrict_to_endpoints(EDGE_SYNC_ACCEPT_ENDPOINTS)
 }
 
 pub fn edge_sync_accept_dedupe_config() -> Result<DedupeConfig, String> {

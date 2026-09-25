@@ -193,6 +193,8 @@ pub struct InternalApiConfig {
     pub require_mtls: bool,
     pub allowed_node_ids: Vec<String>,
     pub compatibility: CompatibilityProfile,
+    /// When set, only these internal paths accept this credential.
+    allowed_endpoints: Option<&'static [&'static str]>,
     auth_runtime: Option<Arc<ManagedStringSecret>>,
 }
 
@@ -216,8 +218,14 @@ impl InternalApiConfig {
             require_mtls,
             allowed_node_ids,
             compatibility: CompatibilityProfile::default(),
+            allowed_endpoints: None,
             auth_runtime: None,
         }
+    }
+
+    pub fn restrict_to_endpoints(mut self, endpoints: &'static [&'static str]) -> Self {
+        self.allowed_endpoints = Some(endpoints);
+        self
     }
 
     pub fn with_compatibility(mut self, compatibility: CompatibilityProfile) -> Self {
@@ -271,6 +279,7 @@ impl PartialEq for InternalApiConfig {
             && self.require_mtls == other.require_mtls
             && self.allowed_node_ids == other.allowed_node_ids
             && self.compatibility == other.compatibility
+            && self.allowed_endpoints == other.allowed_endpoints
     }
 }
 
@@ -772,6 +781,12 @@ pub fn authorize_internal_request_with_policy(
     let Some(internal_api) = internal_api else {
         return Err(text_response(404, "not found"));
     };
+    if internal_api
+        .allowed_endpoints
+        .is_some_and(|allowed| !allowed.contains(&request.path_without_query()))
+    {
+        return Err(text_response(404, "not found"));
+    }
 
     let provided_token = request.header(INTERNAL_RPC_AUTH_HEADER);
     if !internal_api.auth_token_matches(provided_token) {

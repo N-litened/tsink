@@ -10563,6 +10563,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edge_sync_token_only_authorizes_row_ingest() {
+        let storage = make_storage();
+        let engine = make_engine(&storage);
+        let metadata_store = make_metadata_store(None);
+        let exemplar_store = make_exemplar_store(None);
+        let temp_dir = TempDir::new().expect("tempdir should build");
+        let internal_api = edge_sync::edge_sync_accept_internal_api("edge-sync-token");
+        let snapshot_path = temp_dir.path().join("snapshot");
+
+        for (path, body) in [
+            (
+                "/internal/v1/select",
+                json!({"ringVersion": 1, "metric": "m", "labels": [], "start": 0, "end": 10}),
+            ),
+            (
+                "/internal/v1/snapshot_data",
+                json!({"path": snapshot_path.display().to_string()}),
+            ),
+            (
+                "/internal/v1/restore_data",
+                json!({
+                    "snapshotPath": snapshot_path.display().to_string(),
+                    "dataPath": temp_dir.path().join("restored").display().to_string(),
+                }),
+            ),
+        ] {
+            let request = HttpRequest {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                headers: internal_headers(
+                    Some(&internal_api.auth_token),
+                    Some(INTERNAL_RPC_PROTOCOL_VERSION),
+                    &[("content-type", "application/json")],
+                ),
+                body: serde_json::to_vec(&body).expect("body should encode"),
+            };
+            let response = handle_request_with_admin_and_cluster_and_metadata(
+                &storage,
+                &metadata_store,
+                &exemplar_store,
+                None,
+                &engine,
+                request,
+                start_time(),
+                TimestampPrecision::Milliseconds,
+                false,
+                None,
+                Some(&internal_api),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status, 404, "{path}");
+        }
+        assert!(!snapshot_path.exists());
+    }
+
+    #[tokio::test]
     async fn internal_ingest_requires_idempotency_key_when_dedupe_enabled() {
         let storage = make_storage();
         let engine = make_engine(&storage);
