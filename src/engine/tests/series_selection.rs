@@ -472,6 +472,55 @@ fn select_series_handles_regex_matchers_that_match_or_reject_empty_labels() {
 }
 
 #[test]
+fn select_series_matchers_that_match_empty_keep_series_with_explicit_empty_values() {
+    let storage = ChunkStorage::new(2, None);
+    let rows = [
+        vec![Label::new("host", "a"), Label::new("job", "")],
+        vec![Label::new("host", "b")],
+        vec![Label::new("host", "c"), Label::new("job", "foo")],
+        vec![Label::new("host", "d"), Label::new("job", "bar")],
+    ]
+    .into_iter()
+    .map(|labels| Row::with_labels("cpu", labels, DataPoint::new(1, 1.0)))
+    .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let hosts = |matcher: SeriesMatcher| {
+        let mut hosts = storage
+            .select_series(
+                &SeriesSelection::new()
+                    .with_metric("cpu")
+                    .with_matcher(matcher),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|series| {
+                series
+                    .labels
+                    .into_iter()
+                    .find(|label| label.name == "host")
+                    .unwrap()
+                    .value
+            })
+            .collect::<Vec<_>>();
+        hosts.sort();
+        hosts
+    };
+
+    assert_eq!(hosts(SeriesMatcher::equal("job", "")), ["a", "b"]);
+    assert_eq!(hosts(SeriesMatcher::regex_match("job", "")), ["a", "b"]);
+    assert_eq!(
+        hosts(SeriesMatcher::regex_match("job", "foo|")),
+        ["a", "b", "c"]
+    );
+    assert_eq!(
+        hosts(SeriesMatcher::regex_no_match("job", ".+")),
+        ["a", "b"]
+    );
+    assert_eq!(hosts(SeriesMatcher::not_equal("job", "")), ["c", "d"]);
+}
+
+#[test]
 fn select_series_exact_seeded_regex_filter_avoids_live_series_snapshot() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

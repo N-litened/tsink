@@ -13,6 +13,8 @@ impl<'a, P: super::MetadataPostingsProvider + ?Sized> MetadataCandidatePlanner<'
         }
     }
 
+    /// Series whose effective value for the matcher's label is empty: those
+    /// without the label and those that store it with an empty value.
     pub(super) fn missing_label_partition_for_matcher(
         &self,
         matcher: &CompiledSeriesMatcher,
@@ -21,9 +23,10 @@ impl<'a, P: super::MetadataPostingsProvider + ?Sized> MetadataCandidatePlanner<'
             return None;
         }
 
-        self.postings
+        let mut partition = self
+            .postings
             .missing_label_postings_for_name(&matcher.name)
-            .or_else(|| {
+            .unwrap_or_else(|| {
                 let mut missing = self.postings.all_series_postings();
                 if let Some(present) = self
                     .postings
@@ -31,8 +34,13 @@ impl<'a, P: super::MetadataPostingsProvider + ?Sized> MetadataCandidatePlanner<'
                 {
                     missing -= &present;
                 }
-                Some(missing)
-            })
+                missing
+            });
+        // A stored empty value matches exactly like a missing label.
+        if let Some(explicit_empty) = self.postings.postings_for_label(&matcher.name, "") {
+            partition |= explicit_empty;
+        }
+        Some(partition)
     }
 
     fn exact_lookup_bitmap_for_matcher(
